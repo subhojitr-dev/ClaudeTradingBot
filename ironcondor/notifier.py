@@ -84,13 +84,14 @@ def _send(subject: str, html: str) -> None:
 # ── 1. TRADE OPENED ───────────────────────────────────────────────────────────
 
 def notify_condor_opened(
-    spy_price: float, expiry: str,
-    sp_strike: float, sp_delta: float, sp_credit: float,
-    sc_strike: float, sc_delta: float, sc_credit: float,
-    lp_strike: float, lc_strike: float,
-    lp_debit: float, lc_debit: float,
-    net_credit: float, max_risk: float, credit_ratio: float,
-    trend: str, sr_notes: str,
+    symbol: str = "SPY",
+    spy_price: float = 0, expiry: str = "",
+    sp_strike: float = 0, sp_delta: float = 0, sp_credit: float = 0,
+    sc_strike: float = 0, sc_delta: float = 0, sc_credit: float = 0,
+    lp_strike: float = 0, lc_strike: float = 0,
+    lp_debit: float = 0, lc_debit: float = 0,
+    net_credit: float = 0, max_risk: float = 0, credit_ratio: float = 0,
+    trend: str = "neutral", sr_notes: str = "",
     support_levels: list = None, resistance_levels: list = None,
 ) -> None:
     profit_target_credit = round(net_credit * 0.50, 2)
@@ -163,23 +164,24 @@ def notify_condor_opened(
     </div>"""
 
     subject = (
-        f"[IronCondor] OPENED SPY  "
+        f"[IronCondor] OPENED {symbol}  "
         f"${sp_strike:.0f}/{lp_strike:.0f}P · ${sc_strike:.0f}/{lc_strike:.0f}C  "
         f"exp {expiry}  credit=${net_credit:.2f}"
     )
     badge = '<span class="pill pill-blue">TRADE OPENED</span>'
-    _send(subject, _wrap("Iron Condor — Trade Opened", badge, body))
+    _send(subject, _wrap(f"Iron Condor — {symbol} Trade Opened", badge, body))
 
 
 # ── 2. ADJUSTMENT / ROLL ──────────────────────────────────────────────────────
 
 def notify_adjustment(
-    side: str,
-    old_short_strike: float,
-    new_short_strike: float,
-    new_long_strike: float,
-    roll_credit: float,
-    days_remaining: int,
+    symbol: str = "SPY",
+    side: str = "put",
+    old_short_strike: float = 0,
+    new_short_strike: float = 0,
+    new_long_strike: float = 0,
+    roll_credit: float = 0,
+    days_remaining: int = 0,
     spy_price: float = 0,
     current_pnl_pct: float = None,
     cumulative_credit: float = None,
@@ -241,21 +243,22 @@ def notify_adjustment(
     </div>"""
 
     subject = (
-        f"[IronCondor] ADJUSTMENT — {side_upper} side rolled  "
+        f"[IronCondor] ADJUSTMENT — {symbol} {side_upper} side rolled  "
         f"${old_short_strike:.0f} → ${new_short_strike:.0f}  "
         f"({days_remaining} DTE)"
     )
     badge = '<span class="pill pill-amber">ADJUSTMENT / ROLL</span>'
-    _send(subject, _wrap(f"Iron Condor — {side_upper} Spread Rolled", badge, body))
+    _send(subject, _wrap(f"Iron Condor — {symbol} {side_upper} Spread Rolled", badge, body))
 
 
 # ── 3. TRADE CLOSED ───────────────────────────────────────────────────────────
 
 def notify_closed(
-    reason: str,
-    net_credit: float,
-    cost_to_close: float,
-    net_pnl: float,
+    symbol: str = "SPY",
+    reason: str = "",
+    net_credit: float = 0,
+    cost_to_close: float = 0,
+    net_pnl: float = 0,
     pos: dict = None,
 ) -> None:
     """
@@ -371,10 +374,10 @@ def notify_closed(
 
     sign   = "+" if net_pnl >= 0 else ""
     subject = (
-        f"[IronCondor] CLOSED — {result}  {sign}${abs(net_pnl):.0f}  |  "
-        f"SPY  {reason[:40]}"
+        f"[IronCondor] CLOSED {symbol} — {result}  {sign}${abs(net_pnl):.0f}  |  "
+        f"{reason[:40]}"
     )
-    title = f"Iron Condor — Trade Closed ({result})"
+    title = f"Iron Condor — {symbol} Trade Closed ({result})"
     badge = f'<span class="pill {pill_class}">CLOSED · {result}</span>'
     _send(subject, _wrap(title, badge, body))
 

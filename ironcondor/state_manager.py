@@ -74,6 +74,7 @@ def save(state_file: str, state: dict) -> None:
 
 def open_condor(state: dict, symbol: str, legs: dict) -> None:
     state["active"][symbol] = {
+        "symbol":             symbol,
         "status":             "OPEN",
         "entry_date":         date.today().isoformat(),
         "expiry":             legs["expiry"],

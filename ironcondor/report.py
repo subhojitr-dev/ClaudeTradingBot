@@ -2,10 +2,10 @@
 report.py  --  Daily Iron Condor End-of-Day Report
 ====================================================
 Runs at 4:00 PM ET (market close) Mon-Fri via Task Scheduler.
-Sends an HTML email with:
-  - Active condor: all 4 legs, live prices and deltas, P&L per spread, adjustment log
-  - Closed trades from today + recent history (last 10)
-  - Total realised P&L
+
+Shows per-symbol breakdown (SPY / IWM / GLD) plus combined P&L so you
+can see at a glance which condor is winning, which is losing, and what
+the portfolio-level result is.
 """
 
 import logging
@@ -20,7 +20,7 @@ from email.mime.text import MIMEText
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
-    SYMBOL, STATE_FILE, LOG_DIR,
+    SYMBOLS, SYMBOL_CONFIGS, STATE_FILE, LOG_DIR,
     NOTIFY_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD,
     PROFIT_TARGET_PCT, ADJUST_DELTA,
 )
@@ -44,8 +44,8 @@ log = logging.getLogger(__name__)
 # ── HTML helpers ──────────────────────────────────────────────────────────────
 
 _CSS = """
-  body { font-family:Arial, sans-serif; background:#f4f4f4; margin:0; padding:20px; }
-  .card { background:#fff; border-radius:8px; max-width:680px; margin:0 auto;
+  body { font-family:Arial,sans-serif; background:#f4f4f4; margin:0; padding:20px; }
+  .card { background:#fff; border-radius:8px; max-width:720px; margin:0 auto;
           padding:24px; box-shadow:0 2px 8px rgba(0,0,0,.12); }
   h2   { margin:0 0 4px 0; font-size:20px; }
   .sub { color:#666; font-size:13px; margin-bottom:20px; }
@@ -55,23 +55,22 @@ _CSS = """
                    border-bottom:1px solid #e0e0e0; padding-bottom:4px; margin-bottom:10px; }
   table  { width:100%; border-collapse:collapse; font-size:13px; }
   th     { text-align:left; background:#f0f0f0; padding:6px 8px; font-size:12px; color:#555; }
-  td     { padding:6px 8px; border-bottom:1px solid #f5f5f5; }
+  td     { padding:6px 8px; border-bottom:1px solid #f5f5f5; vertical-align:top; }
   .mono  { font-family:monospace; }
   .green { color:#1a7a1a; font-weight:bold; }
   .red   { color:#c0392b; font-weight:bold; }
   .amber { color:#d68910; font-weight:bold; }
-  .warn  { background:#fff3cd; border-left:4px solid #ffc107; padding:8px 12px;
-           font-size:13px; color:#856404; margin-top:8px; border-radius:4px; }
-  .pill  { display:inline-block; padding:2px 10px; border-radius:12px;
-           font-size:12px; font-weight:bold; }
-  .pill-green { background:#d4edda; color:#155724; }
-  .pill-red   { background:#f8d7da; color:#721c24; }
-  .pill-blue  { background:#cce5ff; color:#004085; }
-  .pill-amber { background:#fff3cd; color:#856404; }
-  .kv  { display:flex; justify-content:space-between; padding:4px 0;
-         font-size:13px; border-bottom:1px solid #f8f8f8; }
-  .kv .k { color:#555; }
-  .kv .v { font-weight:bold; }
+  .warn  { background:#fff3cd; border-left:4px solid #ffc107; padding:6px 10px;
+           font-size:12px; color:#856404; margin-top:4px; border-radius:4px; }
+  .pill  { display:inline-block; padding:2px 8px; border-radius:12px;
+           font-size:11px; font-weight:bold; }
+  .pill-green  { background:#d4edda; color:#155724; }
+  .pill-red    { background:#f8d7da; color:#721c24; }
+  .pill-blue   { background:#cce5ff; color:#004085; }
+  .pill-amber  { background:#fff3cd; color:#856404; }
+  .pill-grey   { background:#e2e3e5; color:#383d41; }
+  .summary-box { background:#f8f9fa; border:1px solid #dee2e6; border-radius:6px;
+                 padding:12px 16px; margin-top:6px; font-size:14px; }
   .footer { margin-top:20px; font-size:11px; color:#aaa; text-align:center; }
 """
 
@@ -80,18 +79,15 @@ def _wrap(body_html: str, ts: str) -> str:
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <style>{_CSS}</style></head><body>
 <div class="card">
-  <h2>Iron Condor Bot — End of Day Report</h2>
+  <h2>Iron Condor — End of Day Report</h2>
   <div class="sub">
     <span class="pill pill-blue">DAILY SUMMARY</span>
-    &nbsp; {ts} &nbsp;&middot;&nbsp; SPY &nbsp;&middot;&nbsp; Account: PA34EFPV3B80
+    &nbsp; {ts} &nbsp;&middot;&nbsp;
+    SPY &middot; IWM &middot; GLD &nbsp;&middot;&nbsp; Account: PA34EFPV3B80
   </div>
   {body_html}
-  <div class="footer">Iron Condor Bot &mdash; SPY Paper Trading</div>
+  <div class="footer">Iron Condor Bot &mdash; Multi-Symbol Paper Trading</div>
 </div></body></html>"""
-
-
-def _kv(label: str, value: str) -> str:
-    return f'<div class="kv"><span class="k">{label}</span><span class="v">{value}</span></div>'
 
 
 def _pnl_colour(val: float) -> str:
@@ -112,6 +108,66 @@ def _send(subject: str, html: str) -> None:
         s.send_message(msg)
 
 
+# ── Per-symbol snapshot ───────────────────────────────────────────────────────
+
+def _symbol_row(symbol: str, pos: dict) -> tuple[str, float]:
+    """
+    Build one table row for an active condor.
+    Returns (html_row, current_pnl_dollars).
+    """
+    expiry = pos.get("expiry", "?")
+    dtr    = (date.fromisoformat(expiry) - date.today()).days
+    credit = pos.get("net_credit", 0)
+
+    contracts = [pos["short_put"], pos["long_put"], pos["short_call"], pos["long_call"]]
+    snaps     = ac.get_option_snapshots(contracts)
+
+    sp_snap  = snaps.get(pos["short_put"],  {})
+    lp_snap  = snaps.get(pos["long_put"],   {})
+    sc_snap  = snaps.get(pos["short_call"], {})
+    lc_snap  = snaps.get(pos["long_call"],  {})
+
+    sp_mid = ac.mid(sp_snap); sp_d = ac.delta(sp_snap)
+    lp_mid = ac.mid(lp_snap)
+    sc_mid = ac.mid(sc_snap); sc_d = ac.delta(sc_snap)
+    lc_mid = ac.mid(lc_snap)
+
+    put_cost  = sp_mid - lp_mid
+    call_cost = sc_mid - lc_mid
+    total_ctc = put_cost + call_cost
+    pnl_share = credit - total_ctc
+    pnl_total = round(pnl_share * 100, 2)
+    pct_max   = (1 - total_ctc / credit) * 100 if credit > 0 else 0
+
+    pnl_c  = _pnl_colour(pnl_total)
+    put_adj  = " ®" if pos.get("put_adjusted")  else ""
+    call_adj = " ®" if pos.get("call_adjusted") else ""
+
+    # Delta warnings
+    delta_warn = ""
+    if sp_d >= 0.35 or sc_d >= 0.35:
+        delta_warn = f'<div class="warn">⚠ delta elevated (put {sp_d:.3f} / call {sc_d:.3f})</div>'
+
+    adj_count = len(pos.get("adjustment_log", []))
+    adj_tag   = f' <span class="pill pill-amber">{adj_count} adj</span>' if adj_count else ""
+
+    row = f"""
+    <tr>
+      <td><strong>{symbol}</strong>{adj_tag}</td>
+      <td class="mono">${pos.get('short_put_strike',0):.0f}/{pos.get('long_put_strike',0):.0f}P{put_adj}
+          <br>${pos.get('short_call_strike',0):.0f}/{pos.get('long_call_strike',0):.0f}C{call_adj}</td>
+      <td>{expiry}<br><span style="color:#888;font-size:11px;">{dtr} days left</span></td>
+      <td class="mono">${credit:.2f}<br>
+          <span style="color:#888;font-size:11px;">${credit*100:.0f} total</span></td>
+      <td class="mono">put Δ={sp_d:.3f}<br>call Δ={sc_d:.3f}</td>
+      <td class="mono {pnl_c}">{'+' if pnl_total>=0 else ''}${pnl_total:.2f}
+          <br><span style="font-size:11px;">{pct_max:+.0f}% of max</span></td>
+    </tr>
+    {'<tr><td colspan="6">' + delta_warn + '</td></tr>' if delta_warn else ''}"""
+
+    return row, pnl_total
+
+
 # ── Report builder ────────────────────────────────────────────────────────────
 
 def build_report() -> str:
@@ -123,193 +179,156 @@ def build_report() -> str:
 
     sections = []
 
-    # ── Active condor ─────────────────────────────────────────────────────────
-    pos = active.get(SYMBOL)
-    if pos:
-        expiry  = pos.get("expiry", "?")
-        dtr     = (date.fromisoformat(expiry) - date.today()).days
-        credit  = pos.get("net_credit", 0)
-        max_risk= pos.get("max_risk", 0)
+    # ── Per-symbol active condors ──────────────────────────────────────────────
+    rows         = ""
+    combined_pnl = 0.0
+    open_count   = 0
 
-        # Fetch live snapshots for all 4 legs
-        contracts = [pos["short_put"], pos["long_put"], pos["short_call"], pos["long_call"]]
-        snaps     = ac.get_option_snapshots(contracts)
-
-        sp_snap = snaps.get(pos["short_put"],  {})
-        lp_snap = snaps.get(pos["long_put"],   {})
-        sc_snap = snaps.get(pos["short_call"], {})
-        lc_snap = snaps.get(pos["long_call"],  {})
-
-        sp_mid   = ac.mid(sp_snap);   sp_d = ac.delta(sp_snap)
-        lp_mid   = ac.mid(lp_snap)
-        sc_mid   = ac.mid(sc_snap);   sc_d = ac.delta(sc_snap)
-        lc_mid   = ac.mid(lc_snap)
-
-        put_cost  = sp_mid - lp_mid
-        call_cost = sc_mid - lc_mid
-        total_ctc = put_cost + call_cost
-        pnl_share = credit - total_ctc
-        pnl_total = pnl_share * 100
-        pct_max   = (1 - total_ctc / credit) * 100 if credit > 0 else 0
-
-        profit_target_dollar = credit * PROFIT_TARGET_PCT * 100
-
-        put_adj_tag  = " <em style='color:#888'>(rolled)</em>" if pos.get("put_adjusted")  else ""
-        call_adj_tag = " <em style='color:#888'>(rolled)</em>" if pos.get("call_adjusted") else ""
-
-        pnl_c = _pnl_colour(pnl_total)
-
-        # Warning if either short delta is elevated
-        warnings = ""
-        if sp_d >= 0.35:
-            warnings += f'<div class="warn">⚠ PUT side delta {sp_d:.3f} is elevated — adjustment triggers at {ADJUST_DELTA}</div>'
-        if sc_d >= 0.35:
-            warnings += f'<div class="warn">⚠ CALL side delta {sc_d:.3f} is elevated — adjustment triggers at {ADJUST_DELTA}</div>'
-
-        # Adjustment log
-        adj_rows = ""
-        for a in pos.get("adjustment_log", []):
-            sign = "+" if a["roll_credit"] >= 0 else ""
-            adj_rows += (
-                f"<tr><td>{a['date']}</td>"
-                f"<td>{a['side'].upper()}</td>"
-                f"<td class='mono'>${a.get('new_short_strike',0):.0f} / ${a.get('new_long_strike',0):.0f}</td>"
-                f"<td class='mono'>{sign}${abs(a['roll_credit']):.2f}</td></tr>"
-            )
-        adj_section = ""
-        if adj_rows:
-            adj_section = f"""
-            <div style="margin-top:10px;">
-              <strong style="font-size:12px;">Adjustments made:</strong>
-              <table style="margin-top:4px;">
-                <tr><th>Date</th><th>Side</th><th>New spread</th><th>Roll credit</th></tr>
-                {adj_rows}
-              </table>
-            </div>"""
-
-        sections.append(f"""
-        <div class="section">
-          <div class="section-title">Active Iron Condor — SPY</div>
-          {_kv("Entry date", pos.get('entry_date','?'))}
-          {_kv("Expiry", f"{expiry}  ({dtr} days remaining)")}
-          {_kv("SPY at entry", f"${pos.get('spy_price_at_entry',0):.2f}")}
-          {_kv("Net credit collected", f"${credit:.2f}/share  (${credit*100:.0f} total)")}
-          {_kv("Maximum risk", f"${max_risk:.2f}/share  (${max_risk*100:.0f} total)")}
-          {_kv("Profit target (50%)", f"${profit_target_dollar:.0f}")}
-
-          <div style="margin-top:12px;">
-          <table>
-            <tr><th>Leg</th><th>Strike</th><th>Delta</th><th>Entry</th><th>Now</th><th>Leg P&amp;L</th></tr>
+    for symbol in SYMBOLS:
+        pos = active.get(symbol)
+        if pos:
+            row, pnl = _symbol_row(symbol, pos)
+            rows        += row
+            combined_pnl += pnl
+            open_count   += 1
+        else:
+            rows += f"""
             <tr>
-              <td>Sell Put{put_adj_tag}</td>
-              <td class="mono">${pos.get('short_put_strike',0):.0f}</td>
-              <td class="mono {'amber' if sp_d >= 0.35 else ''}">{sp_d:.3f}</td>
-              <td class="mono">${pos.get('short_put_credit',0):.2f}</td>
-              <td class="mono">${sp_mid:.2f}</td>
-              <td class="mono {'green' if pos.get('short_put_credit',0)-sp_mid>=0 else 'red'}">{'+' if pos.get('short_put_credit',0)-sp_mid>=0 else ''}${(pos.get('short_put_credit',0)-sp_mid)*100:.2f}</td>
-            </tr>
-            <tr>
-              <td>Buy Put</td>
-              <td class="mono">${pos.get('long_put_strike',0):.0f}</td>
-              <td class="mono">—</td>
-              <td class="mono">${pos.get('long_put_debit',0):.2f}</td>
-              <td class="mono">${lp_mid:.2f}</td>
-              <td class="mono {'green' if lp_mid-pos.get('long_put_debit',0)>=0 else 'red'}">{'+' if lp_mid-pos.get('long_put_debit',0)>=0 else ''}${(lp_mid-pos.get('long_put_debit',0))*100:.2f}</td>
-            </tr>
-            <tr>
-              <td>Sell Call{call_adj_tag}</td>
-              <td class="mono">${pos.get('short_call_strike',0):.0f}</td>
-              <td class="mono {'amber' if sc_d >= 0.35 else ''}">{sc_d:.3f}</td>
-              <td class="mono">${pos.get('short_call_credit',0):.2f}</td>
-              <td class="mono">${sc_mid:.2f}</td>
-              <td class="mono {'green' if pos.get('short_call_credit',0)-sc_mid>=0 else 'red'}">{'+' if pos.get('short_call_credit',0)-sc_mid>=0 else ''}${(pos.get('short_call_credit',0)-sc_mid)*100:.2f}</td>
-            </tr>
-            <tr>
-              <td>Buy Call</td>
-              <td class="mono">${pos.get('long_call_strike',0):.0f}</td>
-              <td class="mono">—</td>
-              <td class="mono">${pos.get('long_call_debit',0):.2f}</td>
-              <td class="mono">${lc_mid:.2f}</td>
-              <td class="mono {'green' if lc_mid-pos.get('long_call_debit',0)>=0 else 'red'}">{'+' if lc_mid-pos.get('long_call_debit',0)>=0 else ''}${(lc_mid-pos.get('long_call_debit',0))*100:.2f}</td>
-            </tr>
-          </table>
-          </div>
+              <td><strong>{symbol}</strong></td>
+              <td colspan="5" style="color:#888; font-style:italic;">
+                No open condor — scanning for entry each cycle
+              </td>
+            </tr>"""
 
-          <div style="margin-top:10px; font-size:13px; border-top:2px solid #e0e0e0; padding-top:8px;">
-            Cost to close now: <strong>${total_ctc:.2f}/share</strong> &nbsp;&middot;&nbsp;
-            Net P&amp;L: <strong class="{pnl_c}">{'+' if pnl_total>=0 else ''}${pnl_total:.2f}</strong>
-            &nbsp;&middot;&nbsp;
-            <strong class="{pnl_c}">{pct_max:+.0f}%</strong> of max profit captured
-          </div>
-          {warnings}
-          {adj_section}
-        </div>""")
-    else:
-        sections.append("""
-        <div class="section">
-          <div class="section-title">Active Iron Condor</div>
-          <p style="font-size:13px; color:#666; margin:0;">No open condor at market close.</p>
-        </div>""")
+    comb_c = _pnl_colour(combined_pnl)
+
+    sections.append(f"""
+    <div class="section">
+      <div class="section-title">Active Condors ({open_count} / {len(SYMBOLS)} open)</div>
+      <table>
+        <tr>
+          <th>Symbol</th>
+          <th>Strikes</th>
+          <th>Expiry</th>
+          <th>Credit</th>
+          <th>Short Deltas</th>
+          <th>P&amp;L Today</th>
+        </tr>
+        {rows}
+      </table>
+
+      <div class="summary-box" style="margin-top:12px;">
+        <strong>Combined Portfolio P&amp;L:</strong>
+        &nbsp; <span class="{comb_c}" style="font-size:16px;">
+          {'+' if combined_pnl>=0 else ''}${combined_pnl:.2f}
+        </span>
+        &nbsp;&nbsp;
+        <span style="color:#666; font-size:12px;">
+          ({open_count} condor{'s' if open_count!=1 else ''} open across {len(SYMBOLS)} symbols)
+        </span>
+      </div>
+    </div>""")
+
+    # ── Correlation reminder ───────────────────────────────────────────────────
+    sections.append("""
+    <div class="section">
+      <div class="section-title">Diversification Context</div>
+      <table>
+        <tr><th>Pair</th><th>Correlation</th><th>Implication</th></tr>
+        <tr><td>SPY + IWM</td><td>~0.75</td>
+            <td>Moderate — small-cap diverges from large-cap in risk-off events</td></tr>
+        <tr><td>SPY + GLD</td><td>~0.05</td>
+            <td>Near-zero — gold often rises when stocks fall (true hedge)</td></tr>
+        <tr><td>IWM + GLD</td><td>~0.02</td>
+            <td>Near-zero — essentially independent</td></tr>
+      </table>
+      <p style="font-size:12px; color:#666; margin:6px 0 0;">
+        Probability all three lose simultaneously: ~0.8% per cycle (&lt;1 in 100).
+      </p>
+    </div>""")
 
     # ── Closed today ──────────────────────────────────────────────────────────
     closed_today = [h for h in history if h.get("close_date") == today]
     if closed_today:
         rows = ""
+        day_pnl = 0.0
         for h in closed_today:
             pnl   = h.get("net_pnl", 0) or 0
+            day_pnl += pnl
+            sym   = h.get("symbol", "?")
             pnl_c = _pnl_colour(pnl)
             rows += (
                 f"<tr>"
+                f"<td><strong>{sym}</strong></td>"
                 f"<td>{h.get('entry_date','?')}</td>"
                 f"<td>{h.get('expiry','?')}</td>"
-                f"<td class='mono'>${h.get('short_put_strike',0):.0f}/{h.get('long_put_strike',0):.0f}P · "
-                f"${h.get('short_call_strike',0):.0f}/{h.get('long_call_strike',0):.0f}C</td>"
                 f"<td class='mono'>${h.get('net_credit',0):.2f}</td>"
                 f"<td class='mono {pnl_c}'>{'+' if pnl>=0 else ''}${pnl:.2f}</td>"
-                f"<td style='font-size:12px;color:#666;'>{h.get('close_reason','?')}</td>"
+                f"<td style='font-size:11px;color:#666;'>{h.get('close_reason','?')[:35]}</td>"
                 f"</tr>"
             )
+        day_c = _pnl_colour(day_pnl)
         sections.append(f"""
         <div class="section">
           <div class="section-title">Closed Today ({len(closed_today)})</div>
           <table>
-            <tr><th>Entry</th><th>Expiry</th><th>Strikes</th><th>Credit</th><th>P&amp;L</th><th>Reason</th></tr>
+            <tr><th>Symbol</th><th>Entry</th><th>Expiry</th>
+                <th>Credit</th><th>P&amp;L</th><th>Reason</th></tr>
             {rows}
           </table>
+          <div style="margin-top:6px; font-size:13px;">
+            Today's realised P&amp;L: <strong class="{day_c}">{'+' if day_pnl>=0 else ''}${day_pnl:.2f}</strong>
+          </div>
         </div>""")
 
-    # ── Recent history ────────────────────────────────────────────────────────
-    recent = history[-10:] if history else []
+    # ── Recent history with combined totals ───────────────────────────────────
+    recent = history[-15:] if history else []
     if recent:
-        rows      = ""
-        total_pnl = 0.0
+        rows          = ""
+        total_pnl     = 0.0
+        wins = losses = 0
+
         for h in reversed(recent):
             pnl   = h.get("net_pnl", 0) or 0
             total_pnl += pnl
+            sym   = h.get("symbol", "?")
             pnl_c = _pnl_colour(pnl)
             adjs  = len(h.get("adjustment_log", []))
+            if pnl >= 0:
+                wins += 1
+            else:
+                losses += 1
             rows += (
                 f"<tr>"
+                f"<td><strong>{sym}</strong></td>"
                 f"<td>{h.get('entry_date','?')}</td>"
                 f"<td>{h.get('close_date','?')}</td>"
                 f"<td>{h.get('expiry','?')}</td>"
                 f"<td class='mono'>${h.get('net_credit',0):.2f}</td>"
                 f"<td class='mono {pnl_c}'>{'+' if pnl>=0 else ''}${pnl:.2f}</td>"
-                f"<td style='text-align:center;'>{'✓' if adjs else '—'} {adjs or ''}</td>"
-                f"<td style='font-size:11px;color:#666;'>{h.get('close_reason','?')[:30]}</td>"
+                f"<td style='text-align:center;'>{'✓ '+str(adjs) if adjs else '—'}</td>"
+                f"<td style='font-size:11px;color:#666;'>{h.get('close_reason','?')[:28]}</td>"
                 f"</tr>"
             )
-        t_c = _pnl_colour(total_pnl)
+
+        t_c      = _pnl_colour(total_pnl)
+        win_rate = round(wins / (wins + losses) * 100) if (wins + losses) else 0
         sections.append(f"""
         <div class="section">
-          <div class="section-title">Last {len(recent)} Closed Trades</div>
+          <div class="section-title">Last {len(recent)} Closed Trades (All Symbols)</div>
           <table>
-            <tr><th>Entry</th><th>Closed</th><th>Expiry</th><th>Credit</th><th>P&amp;L</th><th>Adj</th><th>Reason</th></tr>
+            <tr><th>Symbol</th><th>Entry</th><th>Closed</th><th>Expiry</th>
+                <th>Credit</th><th>P&amp;L</th><th>Adj</th><th>Reason</th></tr>
             {rows}
           </table>
-          <div style="margin-top:8px; font-size:13px;">
-            Cumulative P&amp;L (last {len(recent)} trades):
-            <strong class="{t_c}">{'+' if total_pnl>=0 else ''}${total_pnl:.2f}</strong>
+          <div class="summary-box" style="margin-top:10px;">
+            <strong>Last {len(recent)} trades:</strong>
+            &nbsp; Net P&amp;L: <span class="{t_c}"><strong>{'+' if total_pnl>=0 else ''}${total_pnl:.2f}</strong></span>
+            &nbsp;&nbsp;&middot;&nbsp;&nbsp;
+            Win rate: <strong>{win_rate}%</strong>
+            ({wins}W / {losses}L)
+            &nbsp;&nbsp;&middot;&nbsp;&nbsp;
+            Expected ≥80%
           </div>
         </div>""")
     else:
@@ -323,13 +342,13 @@ def build_report() -> str:
 
 
 def run():
-    log.info("Generating Iron Condor daily report...")
+    log.info("Generating Iron Condor daily report (SPY + IWM + GLD)...")
     try:
         html      = build_report()
         today_str = datetime.now().strftime("%Y-%m-%d")
-        subject   = f"[IronCondor] Daily Report — {today_str}"
+        subject   = f"[IronCondor] Daily Report — {today_str}  SPY · IWM · GLD"
         _send(subject, html)
-        log.info("Iron Condor report emailed to %s", NOTIFY_EMAIL)
+        log.info("Report emailed to %s", NOTIFY_EMAIL)
 
         report_path = os.path.join(LOG_DIR, f"report_{datetime.now().strftime('%Y%m%d')}.html")
         with open(report_path, "w", encoding="utf-8") as f:
