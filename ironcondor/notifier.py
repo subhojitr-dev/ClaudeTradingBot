@@ -9,6 +9,9 @@ Four notification types:
 
 import smtplib
 import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import email_archive
 from datetime import date, datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -79,6 +82,7 @@ def _send(subject: str, html: str) -> None:
             s.send_message(msg)
     except Exception as e:
         print(f"[notifier] Email failed: {e}", file=sys.stderr)
+    email_archive.save(subject, html)
 
 
 # ── 1. TRADE OPENED ───────────────────────────────────────────────────────────
@@ -164,7 +168,7 @@ def notify_condor_opened(
     </div>"""
 
     subject = (
-        f"[IronCondor] OPENED {symbol}  "
+        f"TradingBot: [IronCondor] OPENED {symbol}  "
         f"${sp_strike:.0f}/{lp_strike:.0f}P · ${sc_strike:.0f}/{lc_strike:.0f}C  "
         f"exp {expiry}  credit=${net_credit:.2f}"
     )
@@ -243,7 +247,7 @@ def notify_adjustment(
     </div>"""
 
     subject = (
-        f"[IronCondor] ADJUSTMENT — {symbol} {side_upper} side rolled  "
+        f"TradingBot: [IronCondor] ADJUSTMENT — {symbol} {side_upper} side rolled  "
         f"${old_short_strike:.0f} → ${new_short_strike:.0f}  "
         f"({days_remaining} DTE)"
     )
@@ -374,7 +378,7 @@ def notify_closed(
 
     sign   = "+" if net_pnl >= 0 else ""
     subject = (
-        f"[IronCondor] CLOSED {symbol} — {result}  {sign}${abs(net_pnl):.0f}  |  "
+        f"TradingBot: [IronCondor] CLOSED {symbol} — {result}  {sign}${abs(net_pnl):.0f}  |  "
         f"{reason[:40]}"
     )
     title = f"Iron Condor — {symbol} Trade Closed ({result})"
@@ -405,7 +409,7 @@ def notify_no_entry(reason: str) -> None:
     </div>"""
 
     _send(
-        "[IronCondor] Entry scan — no trade placed",
+        "TradingBot: [IronCondor] Entry scan — no trade placed",
         _wrap("Iron Condor — No Entry Today",
               '<span class="pill pill-blue">SCAN · NO TRADE</span>', body),
     )

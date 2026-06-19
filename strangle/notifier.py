@@ -1,75 +1,257 @@
-"""
-notifier.py  --  Email alerts for the strangle bot
+"""notifier.py  --  Rich HTML email alerts for the Strangle bot
+
+Four notification types:
+  notify_strangle_opened  -- entry with call + put legs and earnings context
+  notify_call_sold        -- call leg closed pre-earnings with P&L
+  notify_put_sold         -- put leg closed post-earnings with full trade P&L
+  notify_iv_skip          -- skipped entry due to elevated IV
 """
 
 import smtplib
 import sys
 import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import email_archive
+from datetime import datetime
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from config import NOTIFY_EMAIL, SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD
 
+_CSS = """
+  body { font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 20px; }
+  .card { background: #ffffff; border-radius: 8px; max-width: 640px; margin: 0 auto;
+          padding: 24px; box-shadow: 0 2px 8px rgba(0,0,0,.12); }
+  h2   { margin: 0 0 4px 0; font-size: 20px; }
+  .sub { color: #666; font-size: 13px; margin-bottom: 20px; }
+  .section { margin-top: 18px; }
+  .section-title { font-weight: bold; font-size: 13px; color: #444;
+                   text-transform: uppercase; letter-spacing: .5px;
+                   border-bottom: 1px solid #e0e0e0; padding-bottom: 4px; margin-bottom: 10px; }
+  table  { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th     { text-align: left; background: #f0f0f0; padding: 6px 8px; font-size: 12px; color: #555; }
+  td     { padding: 6px 8px; border-bottom: 1px solid #f0f0f0; }
+  .mono  { font-family: monospace; font-size: 13px; }
+  .green { color: #1a7a1a; font-weight: bold; }
+  .red   { color: #c0392b; font-weight: bold; }
+  .amber { color: #d68910; font-weight: bold; }
+  .pill  { display: inline-block; padding: 2px 10px; border-radius: 12px;
+            font-size: 12px; font-weight: bold; }
+  .pill-green  { background: #d4edda; color: #155724; }
+  .pill-red    { background: #f8d7da; color: #721c24; }
+  .pill-blue   { background: #cce5ff; color: #004085; }
+  .pill-amber  { background: #fff3cd; color: #856404; }
+  .pill-gray   { background: #e2e3e5; color: #383d41; }
+  .kv    { display: flex; justify-content: space-between; padding: 4px 0;
+           font-size: 14px; border-bottom: 1px solid #f5f5f5; }
+  .kv .k { color: #555; }
+  .kv .v { font-weight: bold; }
+  .footer { margin-top: 20px; font-size: 11px; color: #aaa; text-align: center; }
+"""
 
-def send_email(subject: str, body: str) -> None:
-    msg            = MIMEText(body)
+
+def _wrap(title: str, badge_html: str, body_html: str) -> str:
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<style>{_CSS}</style></head><body>
+<div class="card">
+  <h2>{title}</h2>
+  <div class="sub">{badge_html} &nbsp; {ts}</div>
+  {body_html}
+  <div class="footer">Strangle Bot &mdash; Earnings Play Paper Trading</div>
+</div></body></html>"""
+
+
+def _kv(label: str, value: str) -> str:
+    return f'<div class="kv"><span class="k">{label}</span><span class="v">{value}</span></div>'
+
+
+def _send(subject: str, html: str) -> None:
+    msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = SMTP_USER
     msg["To"]      = NOTIFY_EMAIL
+    import re
+    plain = re.sub(r"<[^>]+>", "", html).strip()
+    msg.attach(MIMEText(plain, "plain"))
+    msg.attach(MIMEText(html,  "html"))
     try:
         with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as s:
             s.starttls()
             s.login(SMTP_USER, SMTP_PASSWORD.replace(" ", ""))
             s.send_message(msg)
     except Exception as e:
-        print(f"[notifier] Email send failed: {e}", file=sys.stderr)
+        print(f"[notifier] Email failed: {e}", file=sys.stderr)
+    email_archive.save(subject, html)
 
 
-def notify_strangle_opened(symbol: str, earnings_date: str, call: str, put: str,
-                            call_price: float, put_price: float, total_cost: float) -> None:
-    send_email(
-        f"[Strangle] OPENED {symbol} — earnings {earnings_date}",
-        f"Strangle opened on {symbol}\n\n"
-        f"  Earnings date : {earnings_date}\n"
-        f"  CALL contract : {call}  @ ${call_price:.2f}\n"
-        f"  PUT  contract : {put}   @ ${put_price:.2f}\n"
-        f"  Total cost    : ${total_cost:.2f}\n\n"
-        f"Monitoring: sell CALL if +15%, sell PUT after earnings if +10%.",
+# ── 1. STRANGLE OPENED ────────────────────────────────────────────────────────
+
+def notify_strangle_opened(
+    symbol: str,
+    earnings_date: str,
+    call: str,
+    put: str,
+    call_price: float,
+    put_price: float,
+    total_cost: float,
+) -> None:
+    legs_html = f"""
+    <table>
+      <tr><th>Leg</th><th>Contract</th><th>Type</th><th>Cost</th><th>Target exit</th></tr>
+      <tr>
+        <td>Buy Call</td>
+        <td class="mono">{call}</td>
+        <td><span class="pill pill-green">CALL</span></td>
+        <td class="mono green">${call_price:.2f}</td>
+        <td>Sell if +15% pre-earnings</td>
+      </tr>
+      <tr>
+        <td>Buy Put</td>
+        <td class="mono">{put}</td>
+        <td><span class="pill pill-blue">PUT</span></td>
+        <td class="mono green">${put_price:.2f}</td>
+        <td>Sell if +10% post-earnings</td>
+      </tr>
+    </table>"""
+
+    body = f"""
+    <div class="section">
+      <div class="section-title">Trade Setup</div>
+      {_kv("Symbol", f"<span class='mono'>{symbol}</span>")}
+      {_kv("Earnings date", f"<span class='amber'>{earnings_date}</span>")}
+      {_kv("Strategy", "Long strangle — profit if stock moves sharply either direction")}
+      {_kv("Total cost", f"<span class='red'>${total_cost:.2f}  (max loss if both expire worthless)</span>")}
+    </div>
+
+    <div class="section">
+      <div class="section-title">Legs Purchased</div>
+      {legs_html}
+    </div>
+
+    <div class="section">
+      <div class="section-title">Monitoring Plan</div>
+      {_kv("Pre-earnings", "If CALL rises 15%+ → sell call, lock in gains, hold put")}
+      {_kv("Post-earnings", "If PUT rises 10%+ → sell put → trade fully closed")}
+      {_kv("Check frequency", "Every 2 hours during market hours")}
+    </div>"""
+
+    _send(
+        f"TradingBot: [Strangle] OPENED {symbol} — earnings {earnings_date}",
+        _wrap(f"Strangle — {symbol} Trade Opened",
+              '<span class="pill pill-blue">TRADE OPENED</span>', body),
     )
 
 
-def notify_call_sold(symbol: str, contract: str, entry: float, exit_price: float,
-                     gain_pct: float) -> None:
-    pnl = (exit_price - entry) * 100
-    send_email(
-        f"[Strangle] CALL SOLD {symbol} — +{gain_pct:.1%} pre-earnings",
-        f"Call leg sold on {symbol} before earnings.\n\n"
-        f"  Contract   : {contract}\n"
-        f"  Entry      : ${entry:.2f}\n"
-        f"  Exit       : ${exit_price:.2f}\n"
-        f"  Gain       : +{gain_pct:.1%}  (${pnl:.2f})\n\n"
-        f"Holding PUT through earnings. Will sell if PUT rises 10%.",
+# ── 2. CALL LEG SOLD (pre-earnings) ──────────────────────────────────────────
+
+def notify_call_sold(
+    symbol: str,
+    contract: str,
+    entry: float,
+    exit_price: float,
+    gain_pct: float,
+) -> None:
+    pnl       = (exit_price - entry) * 100
+    pnl_sign  = "+" if pnl >= 0 else ""
+    pct_sign  = "+" if gain_pct >= 0 else ""
+    pnl_class = "green" if pnl >= 0 else "red"
+
+    body = f"""
+    <div class="section">
+      <div class="section-title">Call Leg Closed — Pre-Earnings</div>
+      {_kv("Symbol", f"<span class='mono'>{symbol}</span>")}
+      {_kv("Contract", f"<span class='mono'>{contract}</span>")}
+      {_kv("Entry price", f"${entry:.2f}")}
+      {_kv("Exit price",  f"${exit_price:.2f}")}
+      {_kv("Gain",        f"<span class='{pnl_class}'>{pct_sign}{gain_pct:.1%}  ({pnl_sign}${pnl:.2f})</span>")}
+    </div>
+
+    <div class="section">
+      <div class="section-title">What Happens Next</div>
+      <p style="font-size:14px; color:#444; margin:0;">
+        The call leg has been sold to lock in pre-earnings gains.
+        The put leg is still open and will be monitored through the earnings announcement.
+        Target: sell the put if it rises 10% or more post-earnings.
+      </p>
+    </div>"""
+
+    _send(
+        f"TradingBot: [Strangle] CALL SOLD {symbol} — {pct_sign}{gain_pct:.1%} pre-earnings",
+        _wrap(f"Strangle — {symbol} Call Leg Sold",
+              '<span class="pill pill-green">CALL SOLD</span>', body),
     )
 
 
-def notify_put_sold(symbol: str, contract: str, entry: float, exit_price: float,
-                    gain_pct: float, net_pnl: float) -> None:
-    send_email(
-        f"[Strangle] PUT SOLD {symbol} — +{gain_pct:.1%} post-earnings",
-        f"Put leg sold on {symbol} after earnings.\n\n"
-        f"  Contract   : {contract}\n"
-        f"  Entry      : ${entry:.2f}\n"
-        f"  Exit       : ${exit_price:.2f}\n"
-        f"  Gain       : +{gain_pct:.1%}\n"
-        f"  Net P&L    : ${net_pnl:.2f}  (both legs combined)\n\n"
-        f"Strangle is now fully closed.",
+# ── 3. PUT LEG SOLD (post-earnings, trade fully closed) ───────────────────────
+
+def notify_put_sold(
+    symbol: str,
+    contract: str,
+    entry: float,
+    exit_price: float,
+    gain_pct: float,
+    net_pnl: float,
+) -> None:
+    result     = "PROFIT" if net_pnl >= 0 else "LOSS"
+    pnl_class  = "green"    if net_pnl >= 0 else "red"
+    pill_class = "pill-green" if net_pnl >= 0 else "pill-red"
+    pnl_sign   = "+" if net_pnl >= 0 else ""
+    pct_sign   = "+" if gain_pct >= 0 else ""
+
+    body = f"""
+    <div class="section">
+      <div class="section-title">Put Leg Closed — Post-Earnings</div>
+      {_kv("Symbol", f"<span class='mono'>{symbol}</span>")}
+      {_kv("Contract", f"<span class='mono'>{contract}</span>")}
+      {_kv("Entry price", f"${entry:.2f}")}
+      {_kv("Exit price",  f"${exit_price:.2f}")}
+      {_kv("Put leg gain", f"<span class='{pnl_class}'>{pct_sign}{gain_pct:.1%}</span>")}
+    </div>
+
+    <div class="section">
+      <div class="section-title">Final Trade Result</div>
+      {_kv("Net P&amp;L (both legs)",
+           f"<span class='{pnl_class}'>{pnl_sign}${abs(net_pnl):.2f}</span>")}
+      {_kv("Outcome", f"<span class='{pnl_class}'>{result}</span>")}
+      {_kv("Status", "Strangle fully closed — no open legs remaining")}
+    </div>"""
+
+    _send(
+        f"TradingBot: [Strangle] CLOSED {symbol} — {result}  {pnl_sign}${abs(net_pnl):.0f}",
+        _wrap(f"Strangle — {symbol} Trade Closed ({result})",
+              f'<span class="pill {pill_class}">CLOSED · {result}</span>', body),
     )
 
 
-def notify_iv_skip(symbol: str, iv: float, pct: float, threshold: float) -> None:
-    send_email(
-        f"[Strangle] SKIP {symbol} — IV too high ({pct:.0f}th pct)",
-        f"{symbol} meets earnings criteria but IV is elevated — skipping entry.\n\n"
-        f"  Current IV         : {iv:.1%}\n"
-        f"  IV percentile rank : {pct:.0f}th\n"
-        f"  Threshold          : ≤ {threshold:.0f}th percentile\n\n"
-        f"Will recheck on next run.",
+# ── 4. IV SKIP ────────────────────────────────────────────────────────────────
+
+def notify_iv_skip(
+    symbol: str,
+    iv: float,
+    pct: float,
+    threshold: float,
+) -> None:
+    body = f"""
+    <div class="section">
+      <div class="section-title">Entry Skipped — IV Too High</div>
+      {_kv("Symbol", f"<span class='mono'>{symbol}</span>")}
+      {_kv("Current IV", f"<span class='red'>{iv:.1%}</span>")}
+      {_kv("IV percentile rank", f"<span class='red'>{pct:.0f}th percentile</span>")}
+      {_kv("Maximum allowed", f"{threshold:.0f}th percentile")}
+    </div>
+
+    <div class="section">
+      <div class="section-title">Why This Matters</div>
+      <p style="font-size:14px; color:#444; margin:0;">
+        Elevated IV means options are expensive — the market is already pricing in a big move.
+        Buying a strangle when IV is high means overpaying for both legs, which reduces the
+        probability of profit even if the stock moves significantly.
+        The bot will recheck on the next run.
+      </p>
+    </div>"""
+
+    _send(
+        f"TradingBot: [Strangle] SKIP {symbol} — IV too high ({pct:.0f}th percentile)",
+        _wrap(f"Strangle — {symbol} Entry Skipped",
+              '<span class="pill pill-amber">SKIP · HIGH IV</span>', body),
     )

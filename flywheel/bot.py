@@ -57,12 +57,6 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def _email(subject: str, body: str):
-    notifier.send_email(
-        subject=subject, body=body, to=NOTIFY_EMAIL,
-        smtp_host=SMTP_HOST, smtp_port=SMTP_PORT,
-        smtp_user=SMTP_USER, smtp_password=SMTP_PASSWORD,
-    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -99,7 +93,7 @@ def handle_idle(symbol: str, sm: WheelState, positions: dict, cash: float) -> fl
             f"Please add funds to account PA34EFPV3B80."
         )
         log.warning(msg)
-        _email(f"[Flywheel] SKIPPED CSP {symbol} -- insufficient cash", msg)
+        notifier.notify_skipped(symbol, cash, cash_required, strike)
         return cash
 
     log.info("%s: SELL PUT  %s  strike=$%.2f  sell=$%.2f  cash_needed=$%.0f",
@@ -108,17 +102,12 @@ def handle_idle(symbol: str, sm: WheelState, positions: dict, cash: float) -> fl
     try:
         order = ac.place_option_order(contract["symbol"], "sell", 1, sell_price)
         sm.open_csp(symbol, contract, sell_price, 1, order["id"])
-        _email(
-            f"[Flywheel] NEW CSP: SELL {symbol} PUT ${strike:.0f} | ${sell_price*100:.2f} premium",
-            f"Wheel Strategy -- Stage 1 Opened\n"
-            f"{'='*52}\n"
-            f"Symbol     : {symbol}\n"
-            f"Contract   : {contract['symbol']}\n"
-            f"Strike     : ${strike:.2f}  ({int(CSP_STRIKE_DISCOUNT*100)}% below ${price:.2f})\n"
-            f"Expiry     : {contract.get('expiration_date')}\n"
-            f"Premium    : ${sell_price:.2f}/share = ${sell_price*100:.2f} total\n"
-            f"Collateral : ${cash_required:,.0f} reserved\n"
-            f"Order ID   : {order['id']}\n"
+        notifier.notify_csp_opened(
+            symbol=symbol, contract_sym=contract["symbol"],
+            strike=strike, sell_price=sell_price,
+            expiry=contract.get("expiration_date", ""),
+            stock_price=price, cash_required=cash_required,
+            csp_strike_discount=CSP_STRIKE_DISCOUNT, order_id=order["id"],
         )
         return cash - cash_required   # reserve collateral
 
@@ -156,13 +145,10 @@ def handle_csp(symbol: str, sm: WheelState, positions: dict, cash: float) -> flo
             # Expired worthless -- full premium kept
             log.info("%s: CSP expired WORTHLESS -- collecting $%.2f", symbol, entry_prem * 100)
             sm.csp_expired_worthless(symbol)
-            _email(
-                f"[Flywheel] PUT EXPIRED WORTHLESS: {symbol}  +${entry_prem*100:.2f}",
-                f"{symbol} put expired worthless!\n"
-                f"Full premium collected: ${entry_prem*100:.2f}\n"
-                f"Running total ({symbol}): ${sm.get(symbol).get('total_premium_collected',0):,.2f}\n"
-                f"Grand total all symbols: ${sm.total_premium():,.2f}\n\n"
-                f"Opening new CSP next run..."
+            notifier.notify_csp_expired(
+                symbol=symbol, entry_prem=entry_prem,
+                total_premium=sm.get(symbol).get("total_premium_collected", 0),
+                grand_total=sm.total_premium(),
             )
             return cash + strike * 100   # release collateral
 
@@ -173,13 +159,9 @@ def handle_csp(symbol: str, sm: WheelState, positions: dict, cash: float) -> flo
             log.info("%s: PUT ASSIGNED -- received %d shares at $%.2f", symbol, shares, strike)
             sm.csp_assigned(symbol, shares)
             eff_cost = round(strike - entry_prem, 2)
-            _email(
-                f"[Flywheel] ASSIGNED: {symbol} -- now hold {shares} shares",
-                f"Put assigned on {symbol}!\n"
-                f"Received   : {shares} shares at strike ${strike:.2f}\n"
-                f"Premium received: ${entry_prem*100:.2f}\n"
-                f"Effective cost   : ${eff_cost:.2f}/share (after premium)\n"
-                f"Moving to Stage 2 (Covered Call)..."
+            notifier.notify_assigned(
+                symbol=symbol, shares=shares, strike=strike,
+                entry_prem=entry_prem, eff_cost=eff_cost,
             )
             return cash   # cash used to pay for stock
 
@@ -219,13 +201,8 @@ def handle_csp(symbol: str, sm: WheelState, positions: dict, cash: float) -> flo
         try:
             ac.place_option_order(contract_sym, "buy", 1, buy_price)
             sm.csp_closed_early(symbol, current_val, "70pct_profit")
-            _email(
-                f"[Flywheel] 70% PROFIT -- Closed {symbol} PUT early",
-                f"70% profit target reached on {symbol} put!\n"
-                f"Sold for  : ${entry_prem:.4f}/share\n"
-                f"Closed at : ${current_val:.4f}/share\n"
-                f"Profit    : ${(entry_prem - current_val)*100:.2f} (${(entry_prem-current_val):.4f}/share)\n\n"
-                f"Opening new CSP next run..."
+            notifier.notify_csp_closed_early(
+                symbol=symbol, entry_prem=entry_prem, current_val=current_val,
             )
             return cash + strike * 100   # release collateral
         except Exception as e:
@@ -260,13 +237,9 @@ def handle_csp(symbol: str, sm: WheelState, positions: dict, cash: float) -> flo
                 sm.csp_closed_early(symbol, current_val, f"roll_up_to_{new_strike:.0f}")
                 sm.open_csp(symbol, new_c, sell_price, 1, "roll_order")
                 extra_collateral = (new_strike - strike) * 100
-                _email(
-                    f"[Flywheel] ROLLED PUT UP: {symbol}  ${strike:.0f} -> ${new_strike:.0f}",
-                    f"Rolled up put on {symbol}!\n"
-                    f"Old strike : ${strike:.2f}\n"
-                    f"New strike : ${new_strike:.2f}\n"
-                    f"Net credit : ${net_credit*100:.2f} additional premium\n"
-                    f"Expiry unchanged: {expiry_str}\n"
+                notifier.notify_rolled_up(
+                    symbol=symbol, old_strike=strike, new_strike=new_strike,
+                    net_credit=net_credit, expiry=expiry_str,
                 )
                 return cash - extra_collateral
             except Exception as e:
@@ -302,13 +275,9 @@ def handle_cc(symbol: str, sm: WheelState, positions: dict, cash: float) -> floa
             stock_pnl   = (call_strike - stock_cost) * stock_qty
             log.info("%s: shares CALLED AWAY at $%.2f (P&L $%+.2f)", symbol, call_strike, stock_pnl)
             sm.cc_called_away(symbol)
-            _email(
-                f"[Flywheel] CALLED AWAY: {symbol} shares sold at ${call_strike:.2f}",
-                f"Covered call exercised on {symbol}!\n"
-                f"Shares sold : {stock_qty} @ ${call_strike:.2f}\n"
-                f"Stock P&L   : ${stock_pnl:+.2f} (cost basis ${stock_cost:.2f})\n"
-                f"Call premium: ${entry_prem*100:.2f}\n\n"
-                f"Returning to Stage 1 -- new put next run..."
+            notifier.notify_called_away(
+                symbol=symbol, stock_qty=stock_qty, call_strike=call_strike,
+                stock_pnl=stock_pnl, stock_cost=stock_cost, entry_prem=entry_prem,
             )
         else:
             log.warning("%s: stock not in positions (unexpected) -- resetting to IDLE", symbol)
@@ -347,18 +316,12 @@ def handle_cc(symbol: str, sm: WheelState, positions: dict, cash: float) -> floa
         try:
             order = ac.place_option_order(contract["symbol"], "sell", 1, sell_price)
             sm.open_cc(symbol, contract, sell_price, 1, order["id"])
-            _email(
-                f"[Flywheel] NEW CC: SELL {symbol} CALL ${c_strike:.0f} | ${sell_price*100:.2f} premium",
-                f"Wheel Strategy -- Stage 2 (Covered Call)\n"
-                f"{'='*52}\n"
-                f"Symbol     : {symbol}\n"
-                f"Contract   : {contract['symbol']}\n"
-                f"Strike     : ${c_strike:.2f}  ({int(CC_STRIKE_PREMIUM*100)}% above ${price:.2f})\n"
-                f"Delta      : {delta:.3f}\n"
-                f"Expiry     : {contract.get('expiration_date')}\n"
-                f"Premium    : ${sell_price:.2f}/share = ${sell_price*100:.2f} total\n"
-                f"Stock cost : ${stock_cost:.2f}/share (effective after put premium)\n"
-                f"Order ID   : {order['id']}\n"
+            notifier.notify_cc_opened(
+                symbol=symbol, contract_sym=contract["symbol"],
+                c_strike=c_strike, sell_price=sell_price,
+                expiry=contract.get("expiration_date", ""),
+                stock_price=price, delta=delta, stock_cost=stock_cost,
+                cc_strike_premium=CC_STRIKE_PREMIUM, order_id=order["id"],
             )
         except Exception as e:
             log.error("%s: CC order failed: %s", symbol, e)
@@ -371,13 +334,9 @@ def handle_cc(symbol: str, sm: WheelState, positions: dict, cash: float) -> floa
             log.info("%s: CC expired worthless -- keeping stock, collect $%.2f",
                      symbol, entry_prem * 100)
             sm.cc_expired_worthless(symbol)
-            _email(
-                f"[Flywheel] CALL EXPIRED WORTHLESS: {symbol}  +${entry_prem*100:.2f}",
-                f"{symbol} covered call expired worthless!\n"
-                f"Full premium collected : ${entry_prem*100:.2f}\n"
-                f"Still holding {stock_qty} shares\n"
-                f"Running total ({symbol}): ${sm.get(symbol).get('total_premium_collected',0):,.2f}\n"
-                f"Selling new covered call next run..."
+            notifier.notify_cc_expired(
+                symbol=symbol, entry_prem=entry_prem, stock_qty=stock_qty,
+                total_premium=sm.get(symbol).get("total_premium_collected", 0),
             )
         return cash
 
@@ -399,13 +358,9 @@ def handle_cc(symbol: str, sm: WheelState, positions: dict, cash: float) -> floa
         try:
             ac.place_option_order(contract_sym, "buy", 1, buy_price)
             sm.cc_closed_early(symbol, current_val)
-            _email(
-                f"[Flywheel] 70% PROFIT -- Closed {symbol} CALL early",
-                f"70% profit target reached on {symbol} covered call!\n"
-                f"Sold for  : ${entry_prem:.4f}/share\n"
-                f"Closed at : ${current_val:.4f}/share\n"
-                f"Profit    : ${(entry_prem - current_val)*100:.2f}\n"
-                f"Still holding {stock_qty} shares. Selling new call next run..."
+            notifier.notify_cc_closed_early(
+                symbol=symbol, entry_prem=entry_prem, current_val=current_val,
+                stock_qty=stock_qty,
             )
         except Exception as e:
             log.error("%s: CC buy-to-close failed: %s", symbol, e)

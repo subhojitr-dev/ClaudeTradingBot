@@ -16,6 +16,9 @@ __pycache__/
 *.pyd
 .Python
 
+# ── Local email archive (generated HTML, deleted weekly -- not for repo) ──────
+email_archive/
+
 # ── OS artifacts ──────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db

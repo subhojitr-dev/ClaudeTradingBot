@@ -222,21 +222,10 @@ def run():
                 active_symbols.append(ticker)
 
                 # Email alert
-                notifier.send_email(
-                    subject=f"[TradingBot] PHARMA CATALYST: {ticker} added ({event_type})",
-                    body=(
-                        f"Pharma Catalyst Alert -- {ticker} added to trailing stop strategy\n"
-                        f"{'='*58}\n"
-                        f"Ticker     : {ticker}\n"
-                        f"Event Type : {event_type}\n"
-                        f"Headline   : {headline}\n"
-                        f"Source     : {cat.get('source', 'N/A')}\n\n"
-                        f"The bot will buy {INITIAL_QTY} shares and apply the standard\n"
-                        f"trailing stop + ladder-in strategy.\n"
-                    ),
-                    to=cfg.NOTIFY_EMAIL,
-                    smtp_host=cfg.SMTP_HOST, smtp_port=cfg.SMTP_PORT,
-                    smtp_user=cfg.SMTP_USER, smtp_password=cfg.SMTP_PASSWORD,
+                notifier.notify_pharma_catalyst(
+                    ticker=ticker, event_type=event_type,
+                    headline=headline, source=cat.get("source", "N/A"),
+                    initial_qty=INITIAL_QTY, cfg=cfg,
                 )
 
         except Exception as e:

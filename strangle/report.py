@@ -313,7 +313,7 @@ def run():
     try:
         html = build_report()
         today_str = datetime.now().strftime("%Y-%m-%d")
-        subject   = f"[Strangle] Daily Report — {today_str}"
+        subject   = f"TradingBot: [Strangle] Daily Report — {today_str}"
         _send(subject, html)
         log.info("Strangle report emailed to %s", NOTIFY_EMAIL)
 

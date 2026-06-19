@@ -25,15 +25,20 @@ import sys
 from datetime import date
 
 # ── Bootstrap ────────────────────────────────────────────────
-os.makedirs("logs", exist_ok=True)
+_LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(_LOG_DIR, exist_ok=True)
+_today = date.today().strftime("%Y%m%d")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     handlers=[
-        logging.FileHandler(os.path.join("logs", "strangle.log"), encoding="utf-8"),
+        logging.FileHandler(os.path.join(_LOG_DIR, f"strangle_{_today}.log"), encoding="utf-8"),
+        logging.FileHandler(os.path.join(_LOG_DIR, f"errors_{_today}.log"),   encoding="utf-8"),
         logging.StreamHandler(sys.stdout),
     ],
 )
+logging.getLogger().handlers[1].setLevel(logging.ERROR)
 log = logging.getLogger(__name__)
 
 import config

@@ -346,7 +346,7 @@ def run():
     try:
         html      = build_report()
         today_str = datetime.now().strftime("%Y-%m-%d")
-        subject   = f"[IronCondor] Daily Report — {today_str}  SPY · IWM · GLD"
+        subject   = f"TradingBot: [IronCondor] Daily Report — {today_str}  SPY · IWM · GLD"
         _send(subject, html)
         log.info("Report emailed to %s", NOTIFY_EMAIL)
 
