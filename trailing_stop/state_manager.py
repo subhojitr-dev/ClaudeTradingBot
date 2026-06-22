@@ -26,10 +26,12 @@ from typing import Dict, Any
 
 log = logging.getLogger(__name__)
 
+_DIR = os.path.dirname(os.path.abspath(__file__))
+
 
 class StateManager:
     def __init__(self, filepath: str):
-        self.filepath = filepath
+        self.filepath = filepath if os.path.isabs(filepath) else os.path.join(_DIR, filepath)
         self._state: Dict[str, Any] = self._load()
 
     def _load(self) -> Dict:

@@ -53,8 +53,15 @@ from datetime import date
 
 log = logging.getLogger(__name__)
 
+_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _abs(path: str) -> str:
+    return path if os.path.isabs(path) else os.path.join(_DIR, path)
+
 
 def load(state_file: str) -> dict:
+    state_file = _abs(state_file)
     if os.path.exists(state_file):
         try:
             with open(state_file) as f:
@@ -68,7 +75,7 @@ def load(state_file: str) -> dict:
 
 
 def save(state_file: str, state: dict) -> None:
-    with open(state_file, "w") as f:
+    with open(_abs(state_file), "w") as f:
         json.dump(state, f, indent=2, default=str)
 
 

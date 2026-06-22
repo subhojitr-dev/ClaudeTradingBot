@@ -11,6 +11,8 @@ from config import (
     ALPACA_BASE_URL, ALPACA_DATA_URL,
 )
 
+_OPTIONS_DATA_URL = "https://data.alpaca.markets/v1beta1"
+
 log = logging.getLogger(__name__)
 
 HEADERS = {
@@ -120,7 +122,7 @@ def get_option_snapshots(symbols: list) -> dict:
     params = {"symbols": ",".join(symbols[:100]), "feed": "indicative"}
     try:
         r = requests.get(
-            f"{ALPACA_DATA_URL}/options/snapshots",
+            f"{_OPTIONS_DATA_URL}/options/snapshots",
             headers=DATA_HEADERS, params=params, timeout=15,
         )
         r.raise_for_status()
