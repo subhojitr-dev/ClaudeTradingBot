@@ -6,7 +6,7 @@ Account: PA34EFPV3B80 (Options Paper Account)
 import logging
 import requests
 from datetime import date, timedelta
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, ALPACA_DATA_URL
+from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, ALPACA_DATA_URL, ALPACA_OPTIONS_DATA_URL
 
 log = logging.getLogger(__name__)
 
@@ -140,7 +140,7 @@ def get_option_snapshots(symbols: list) -> dict:
     }
     try:
         r = requests.get(
-            f"{ALPACA_DATA_URL}/options/snapshots",
+            f"{ALPACA_OPTIONS_DATA_URL}/options/snapshots",
             headers=DATA_HEADERS, params=params, timeout=15,
         )
         r.raise_for_status()
