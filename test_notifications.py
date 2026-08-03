@@ -128,7 +128,7 @@ for mod in list(sys.modules.keys()):
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "strangle"))
 import notifier as st_notifier
 
-print("  [1/4] Strangle opened...")
+print("  [1/3] Strangle opened...")
 st_notifier.notify_strangle_opened(
     symbol="NVDA",
     earnings_date="2026-07-09",
@@ -139,26 +139,18 @@ st_notifier.notify_strangle_opened(
     total_cost=675.0,
 )
 
-print("  [2/4] Call sold pre-earnings...")
-st_notifier.notify_call_sold(
+print("  [2/3] Combined position closed (profit target)...")
+st_notifier.notify_combined_close(
     symbol="NVDA",
-    contract="NVDA260718C00160000",
-    entry=3.80,
-    exit_price=4.57,
-    gain_pct=0.203,
-)
-
-print("  [3/4] Put sold post-earnings...")
-st_notifier.notify_put_sold(
-    symbol="NVDA",
-    contract="NVDA260718P00120000",
-    entry=2.95,
-    exit_price=3.28,
-    gain_pct=0.112,
+    reason="combined profit target hit (+21.4% >= 20%)",
+    call_sold_price=4.57,
+    put_sold_price=3.28,
+    total_cost=675.0,
+    total_proceeds=785.00,
     net_pnl=110.00,
 )
 
-print("  [4/4] IV skip...")
+print("  [3/3] IV skip...")
 st_notifier.notify_iv_skip(
     symbol="AMZN",
     iv=0.52,
