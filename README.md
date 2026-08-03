@@ -113,7 +113,7 @@ Pelosi Copy Trades:        PANW  AAPL  MSFT  VST  TEM
               ┌──────────────────────────┐
               │  Pharma Catalyst Scan    │
               │  (once per day, cached)  │
-              │  Finviz + FDA RSS        │──→ Add pharma stocks to list
+              │  Alpaca movers + FDA RSS │──→ Add pharma stocks to list
               └────────┬─────────────────┘
                        │
                        ▼
@@ -456,43 +456,60 @@ strangle\
 
 ## Pharma Catalyst Scanner (Rule 5 of Trailing Stop)
 
-Each morning at market open, the trailing stop bot scans 3 sources for biotech/pharma stocks with high-impact catalyst events:
+Each morning at market open, the trailing stop bot scans for biotech/pharma stocks with high-impact catalyst events. No watchlist needed -- the market-movers source is fully dynamic:
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│              PHARMA CATALYST SCANNER                    │
-│              (runs once per day, cached)                │
-├─────────────┬─────────────────┬────────────────────────┤
-│ Finviz News │ Finviz Screener │ FDA Official RSS        │
-│ finviz.com  │ Top biotech     │ fda.gov press releases  │
-│ /news.ashx  │ movers today    │                        │
-└──────┬──────┴────────┬────────┴────────────┬───────────┘
-       │               │                     │
-       └───────────────┴─────────────────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │  Filter for events: │
-                    │  ✅ FDA Approval    │
-                    │  ✅ FDA Decision    │
-                    │  ✅ Phase 3 Results │
-                    │  ✅ Trial Readouts  │
-                    │  ✅ Breakthrough    │
-                    │  ❌ FDA Rejection   │ ← SKIPPED
-                    └──────────┬──────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │ Verify pharma sector│
-                    │ (Finviz sector check│
-                    └──────────┬──────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │  Add to watch list  │
-                    │  Buy 10 shares      │
-                    │  Apply trailing     │
-                    │  stop + ladder-in   │
-                    │  Send email alert   │
-                    └─────────────────────┘
+┌───────────────────────────────────────────────────────────────┐
+│                  PHARMA CATALYST SCANNER                      │
+│                  (runs once per day, cached)                  │
+├───────────────────────────────────┬───────────────────────────┤
+│ Alpaca Big Movers                  │ FDA Official RSS          │
+│ Today's biggest % gainers,         │ fda.gov press releases    │
+│ market-wide (no watchlist) --      │                           │
+│ filtered to plain tickers,         │                           │
+│ price >= $5, gain >= 8%            │                           │
+└──────────────────┬──────────────────┴────────────┬─────────────┘
+                   │                               │
+                   ▼                               │
+        ┌────────────────────────┐                 │
+        │ Verify pharma sector   │                 │
+        │ (Finviz quote page)    │                 │
+        └───────────┬────────────┘                 │
+                    │                               │
+                    ▼                               │
+        ┌────────────────────────┐                 │
+        │ Check own Finviz news  │                 │
+        │ for a classifiable     │                 │
+        │ catalyst headline      │                 │
+        └───────────┬────────────┘                 │
+                    └───────────────┬───────────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │  Filter for events: │
+                         │  ✅ FDA Approval    │
+                         │  ✅ FDA Decision    │
+                         │  ✅ Phase 3 Results │
+                         │  ✅ Trial Readouts  │
+                         │  ✅ Breakthrough    │
+                         │  ❌ FDA Rejection   │ ← SKIPPED
+                         └──────────┬──────────┘
+                                    │
+                         ┌──────────▼──────────┐
+                         │  Add to watch list  │
+                         │  Buy 10 shares      │
+                         │  Apply trailing     │
+                         │  stop + ladder-in   │
+                         │  Send email alert   │
+                         └─────────────────────┘
 ```
+
+> **2026-08-03:** Originally scanned Finviz's general news page and biotech
+> screener directly. Both broke permanently -- Finviz redesigned its news
+> page to no longer tag headlines with a ticker at all, and its screener's
+> results table is now client-side rendered with the CSV export fallback
+> paywalled behind Finviz Elite. Replaced with the Alpaca big-movers
+> approach above, which needs no watchlist and reuses the one piece of
+> Finviz that still works: per-ticker quote pages.
 
 ---
 

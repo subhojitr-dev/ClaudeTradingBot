@@ -74,6 +74,13 @@ C:\Users\subho\tradingbot\
     ├── dashboard.py                     ← Live terminal view with Greeks and P&L per leg
     ├── ironcondor_state.json            ← Live condor state (auto-generated)
     └── run_ironcondor.bat               ← Windows launcher (every 30 min via Task Scheduler)
+
+reports\
+├── daily_report.py                      ← Consolidated trade ledger across all 5 strategies
+├── run_daily_report.bat                 ← Windows launcher (daily at 4:05 PM via Task Scheduler)
+├── trade_ledger.json                    ← Canonical ledger store (auto-generated, gitignored)
+├── trade_ledger.csv                     ← Flattened export, Excel-openable (auto-generated, gitignored)
+└── dashboard.html                       ← Local static snapshot (auto-generated, gitignored)
 ```
 
 ---
@@ -220,10 +227,11 @@ python sell_all.py
 
 **Purpose:** Morning scanner that identifies pharmaceutical and biotech stocks with significant FDA/clinical trial events happening that day. Called once per day by `bot.py` and results are cached to avoid repeated scraping during 30-min polls.
 
-**Data Sources:**
-1. **Finviz News** (`finviz.com/news.ashx`) — scans latest headlines for catalyst keywords
-2. **Finviz Biotech Screener** (`finviz.com/screener.ashx?v=111&f=sec_biotech`) — pulls biotech sector tickers with recent news
-3. **FDA Press Release RSS** (`fda.gov/.../fda-press-releases/rss.xml`) — official FDA announcements
+**Data Sources** (rewritten 2026-08-03 -- see `issues_log.md`-style note below):
+1. **Alpaca Big Movers Screener** (`/v1beta1/screener/stocks/movers`) — today's biggest % gainers market-wide, no watchlist needed. Filtered to plain tickers, price ≥ `MOVERS_MIN_PRICE`, gain ≥ `MOVERS_MIN_PCT_CHANGE`. Each surviving candidate is checked against its own Finviz quote page (`finviz.com/quote.ashx?t=TICKER`) for pharma/biotech sector + a classifiable catalyst headline.
+2. **FDA Press Release RSS** (`fda.gov/.../press-releases/rss.xml`) — official FDA announcements
+
+> **Why it changed:** the original sources were Finviz's general news page and its biotech screener page, scraped directly. Both had been silently broken since the bot's first run (confirmed via logs going back to 2026-07-21) — Finviz redesigned `news.ashx` to no longer tag headlines with a ticker at all, and the screener's results table is now client-side rendered with its CSV export fallback paywalled behind Finviz Elite. The FDA RSS URL had also moved (`fda-press-releases` → `press-releases`). The per-ticker Finviz quote page was confirmed still working, so the new design leans on that instead of the two broken wide-scan pages.
 
 **Keyword Detection (`_classify_event`):**
 
@@ -724,6 +732,39 @@ C:\Users\subho\AppData\Local\Python\bin\python3.14.exe report.py >> logs\report.
 
 ---
 
+## Consolidated Trade Ledger (`reports\`)
+
+### `C:\Users\subho\tradingbot\reports\daily_report.py`
+
+**Purpose:** Builds one row per trade across all 5 strategies, read-only against each bot's own state JSON (never modifies a bot's state) plus live Alpaca prices. Added 2026-08-02.
+
+**Behaviour:**
+- A trade still open gets its current price / gain $ / gain % / `last_updated` overwritten every run.
+- Once a trade is detected closed, its row is written one final time (frozen values, `closed_at` set) and never touched again.
+- Closed trades older than `RETENTION_DAYS` (60) are dropped entirely on the next run; open trades are never pruned regardless of age.
+- Credentials are hardcoded directly (not imported from each bot's `config.py`) to avoid importing multiple same-named `config`/`alpaca_client` modules from different folders — same reason `sell_all.py` hardcodes them.
+
+**Per-strategy row logic:**
+- **Trailing Stop:** one row per symbol (state file key) — open while `status == "active"`, closed using the earliest `stop_loss_sell` order once sold.
+- **Copy Trade:** one row per symbol traded via `trades_tracker.json`, using Alpaca's own `unrealized_pl`/`unrealized_plpc` directly. Since Copy Trade shares an account with Trailing Stop, a shared symbol's position may reflect both bots combined (noted in the row). The bot itself never sells, so a row is only marked closed if a previously-open position disappears from Alpaca (closed outside the bot — manual sell or `sell_all.py`).
+- **Flywheel:** walks each symbol's `history` list to reconstruct past option-leg and stock-lot trades (pairing `sell_put`/`sell_call` with the matching close event), plus the currently open contract and/or stock lot from the top-level state fields.
+- **Strangle / Iron Condor:** both already separate `active` vs `history` in their own state files — active positions get live-priced (option mid or 4-leg cost-to-close), closed trades use their already-recorded `net_pnl`.
+
+**Outputs (this folder, all gitignored):**
+- `trade_ledger.json` — canonical store, read back in on the next run
+- `trade_ledger.csv` — flattened export, Excel-openable
+- `dashboard.html` — local static snapshot for quick viewing
+
+**Feeds:** the Trade Results tab on `trading-analytics-hub.vercel.app`, via `trading_analytics_hub/scripts/sync.mjs` uploading this JSON to Vercel Blob.
+
+---
+
+### `C:\Users\subho\tradingbot\reports\run_daily_report.bat`
+
+**Purpose:** Windows batch launcher for the daily ledger report. Scheduled task `TradeLedgerReport`, weekdays at 4:05 PM — 5 minutes after the other 4:00 PM reports, so all state files have settled first.
+
+---
+
 ## Strangle Strategy (Bi-Directional Earnings Plays)
 
 ### `C:\Users\subho\tradingbot\strangle\config.py`
@@ -859,6 +900,7 @@ These files are created and maintained automatically by the bots. You do not nee
 | `strangle/strangle_state.json` | strangle/bot.py | Forgets all open strangles — bot starts fresh with no active positions |
 | `strangle/iv_history.json` | strangle/iv_checker.py | Resets IV percentile history — filter skipped until 5+ new observations accumulate |
 | `ironcondor/ironcondor_state.json` | ironcondor/bot.py | Forgets open condor — bot will look for a new entry on next run |
+| `reports/trade_ledger.json` | reports/daily_report.py | Forgets all ledger rows (open and closed) — rebuilt fresh from each bot's current state on next run |
 
 ---
 
@@ -881,3 +923,4 @@ schtasks /query /fo TABLE | findstr "trailing\|copytrade\|flywheel\|report\|topu
 | StrangleReport | strangle\run_report.bat | Daily | 4:00 PM |
 | IronCondorBot | ironcondor\run_ironcondor.bat | Every 30 min | Market hours |
 | IronCondorReport | ironcondor\run_report.bat | Daily | 4:00 PM |
+| TradeLedgerReport | reports\run_daily_report.bat | Daily | 4:05 PM |

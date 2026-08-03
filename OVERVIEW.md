@@ -192,6 +192,7 @@ and connected to the internet during market hours, everything happens automatica
 | **Flywheel Daily Report** | 4:00 PM, Mon–Fri | Once (after market closes) |
 | **Strangle Bot** | Market hours, Mon–Fri | Every 2 hours |
 | **Iron Condor Bot** | Market hours, Mon–Fri | Every 30 minutes |
+| **Trade Ledger Report** | 4:05 PM, Mon–Fri | Once (after market closes) |
 
 > **Why every 30 minutes?** Stock prices and politician disclosures don't need
 > to be checked every second. 30 minutes is frequent enough to act on signals
@@ -437,7 +438,8 @@ C:\Users\subho\tradingbot\
 ├── flywheel\            ← Robot 3
 ├── strangle\            ← Robot 4
 ├── ironcondor\          ← Robot 5
-└── daily_topup\         ← Morning cash balance checker
+├── daily_topup\         ← Morning cash balance checker
+└── reports\             ← Consolidated daily trade ledger (feeds the web dashboard)
 ```
 
 For the full file-by-file breakdown, see `FILES.md`.
@@ -551,9 +553,13 @@ FDA or clinical trial event happening today and returns them to the bot for entr
 **How it works:**
 - Runs once per day (result cached in `pharma_catalyst_cache.json` keyed by
   today's date — subsequent 30-min runs return the cached result instantly)
-- Scrapes three data sources in parallel:
-  - **Finviz News** (`finviz.com/news.ashx`) — latest headlines
-  - **Finviz Biotech Screener** — top-moving biotech tickers today
+- No watchlist needed — fully dynamic, two sources:
+  - **Alpaca big-movers screener** — pulls today's biggest % gainers
+    market-wide, filters out penny stocks/warrants, then checks each
+    surviving candidate's Finviz quote page for pharma/biotech sector +
+    a classifiable news headline (2026-08-03: replaced the original
+    Finviz-wide-scan sources after Finviz redesigned its news page to
+    drop ticker links entirely and paywalled its screener's CSV export)
   - **FDA Press Release RSS Feed** — official FDA announcements
 - For each headline/ticker found, `_classify_event()` checks for keywords like
   "FDA approved", "phase 3 results", "PDUFA", "breakthrough therapy". Rejection
@@ -1029,6 +1035,36 @@ dashboard in your browser automatically.
   the dashboard URL, and fires a Windows toast notification using PowerShell
 - Logs each check to `topup_log.json` and to a dated log file
 - Skips if already run today (guards against Task Scheduler running it twice)
+
+---
+
+### Consolidated Trade Ledger (`reports\`)
+
+---
+
+#### `reports/daily_report.py`
+**What it does:** Once per day at 4:05 PM (5 minutes after the other 4 PM
+reports), builds one row per trade across all 5 strategies — every position
+that's currently open gets its price, gain $, gain %, and "last updated" time
+refreshed; every trade that closes gets its final numbers frozen permanently
+and is never touched again. Trades closed more than 60 days ago are dropped
+from the ledger so it doesn't grow forever.
+
+**How it works:** Reads each bot's own state JSON directly (never modifies
+it) plus live prices from Alpaca, using each strategy's own natural
+open/closed bookkeeping — Strangle and Iron Condor already separate active
+vs. history trades cleanly; Flywheel's per-symbol history list is walked to
+reconstruct past option-leg and stock-lot trades; Trailing Stop and Copy
+Trade (which share an account) infer open/closed from Alpaca's live
+positions since neither bot records an explicit close event on its own.
+
+**Outputs:** `trade_ledger.json` (canonical store), `trade_ledger.csv`
+(Excel-openable), and `dashboard.html` (local snapshot) — all in this
+folder, all auto-generated and gitignored.
+
+**Feeds:** the **Trade Results** tab on `trading-analytics-hub.vercel.app`.
+A separate sync script uploads the JSON to Vercel Blob; the web app never
+talks to this PC directly.
 
 ---
 
