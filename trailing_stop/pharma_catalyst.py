@@ -1,8 +1,8 @@
 """
 pharma_catalyst.py  --  Daily Pharma/Biotech Catalyst Scanner
 ==============================================================
-Scans multiple sources each morning for pharmaceutical stocks
-with high-impact catalyst events:
+Scans each morning for pharmaceutical stocks with high-impact catalyst
+events:
 
   - FDA drug approvals (PDUFA decisions, NDAs, BLAs)
   - Phase 2 / Phase 3 clinical trial results
@@ -11,9 +11,19 @@ with high-impact catalyst events:
   - Complete Response Letters (CRL) -- SKIPPED by default
 
 Sources:
-  1. Finviz News  -- https://finviz.com/news.ashx
+  1. Alpaca market-movers screener -- today's biggest % gainers market-wide
+     (no watchlist needed), filtered to penny-stock/warrant noise removed,
+     then each surviving candidate is checked against its own Finviz quote
+     page for pharma/biotech sector + a classifiable news headline.
   2. FDA RSS Feed -- FDA press releases (official approvals)
-  3. Finviz Screener -- top-moving biotech/pharma stocks with news
+
+  (Two earlier sources -- Finviz's general news.ashx page and its biotech
+  screener page -- were removed 2026-08-03. Finviz redesigned news.ashx to
+  no longer tag headlines with a ticker at all, and the screener's results
+  table is now client-side rendered with CSV export paywalled behind
+  Finviz Elite, so neither could reliably be scraped anymore. The
+  still-working piece -- per-ticker quote.ashx pages -- is what source 1
+  above now leans on instead.)
 
 Results are cached per day so the scan only runs once regardless of
 how many times the trailing-stop bot fires during the day.
@@ -23,7 +33,7 @@ Each found stock is returned as:
     "ticker":     "MRNA",
     "headline":   "Moderna Phase 3 trial shows 94% efficacy...",
     "event_type": "TRIAL_RESULTS",
-    "source":     "finviz",
+    "source":     "alpaca_movers",
   }
 """
 
@@ -108,6 +118,12 @@ def scan_today(
     skip_event_types: list = None,
     cache_file: str = "pharma_catalyst_cache.json",
     sector_cache_file: str = "sector_cache.json",
+    alpaca_api_key: str = None,
+    alpaca_secret_key: str = None,
+    alpaca_data_url: str = "https://data.alpaca.markets/v1beta1",
+    movers_min_pct: float = 8.0,
+    movers_min_price: float = 5.0,
+    movers_max_candidates: int = 25,
 ) -> List[Dict]:
     """
     Scan all sources for pharma/biotech catalyst events today.
@@ -117,10 +133,16 @@ def scan_today(
     returns the cached list without re-scanning.
 
     Args:
-        max_stocks       : maximum number of stocks to return
-        skip_event_types : event types to exclude (e.g. ["FDA_REJECTION"])
-        cache_file       : path to daily results cache
-        sector_cache_file: path to persistent sector classification cache
+        max_stocks           : maximum number of stocks to return
+        skip_event_types     : event types to exclude (e.g. ["FDA_REJECTION"])
+        cache_file            : path to daily results cache
+        sector_cache_file    : path to persistent sector classification cache
+        alpaca_api_key/secret: credentials for the Alpaca movers screener
+                                (big-movers source is skipped if not provided)
+        alpaca_data_url       : base URL for Alpaca's screener endpoint
+        movers_min_pct        : minimum % gain today to be worth checking
+        movers_min_price      : minimum price to filter out penny stocks
+        movers_max_candidates : cap on how many movers get checked against Finviz
     """
     skip_event_types = skip_event_types or []
     today_str        = date.today().isoformat()
@@ -137,34 +159,31 @@ def scan_today(
     results: List[Dict] = []
     seen_tickers: set   = set()
 
-    # ── Source 1: Finviz news table ────────────────────────────────────────
-    try:
-        for item in _scan_finviz_news(sector_cache_file):
-            if item["ticker"] not in seen_tickers:
-                results.append(item)
-                seen_tickers.add(item["ticker"])
-        log.info("Finviz news: %d catalyst events found", len(results))
-    except Exception as e:
-        log.error("Finviz news scan failed: %s", e)
+    # ── Source 1: Today's biggest movers (Alpaca), filtered to pharma/biotech ──
+    if alpaca_api_key and alpaca_secret_key:
+        try:
+            movers = _scan_big_movers(
+                sector_cache_file, alpaca_api_key, alpaca_secret_key, alpaca_data_url,
+                movers_min_pct, movers_min_price, movers_max_candidates,
+            )
+            for item in movers:
+                if item["ticker"] not in seen_tickers:
+                    results.append(item)
+                    seen_tickers.add(item["ticker"])
+            log.info("Big movers: %d pharma/biotech catalyst stock(s) found", len(movers))
+        except Exception as e:
+            log.error("Big movers scan failed: %s", e)
+    else:
+        log.warning("Alpaca credentials not provided -- skipping big-movers scan")
 
-    # ── Source 2: Finviz Biotech Screener (top movers with news) ──────────
+    # ── Source 2: FDA official RSS feed ────────────────────────────────────
     try:
-        screener_tickers = _scan_finviz_screener()
-        for item in screener_tickers:
-            if item["ticker"] not in seen_tickers:
-                results.append(item)
-                seen_tickers.add(item["ticker"])
-        log.info("Finviz screener: %d additional stocks", len(screener_tickers))
-    except Exception as e:
-        log.error("Finviz screener scan failed: %s", e)
-
-    # ── Source 3: FDA official RSS feed ────────────────────────────────────
-    try:
+        before = len(seen_tickers)
         for item in _scan_fda_rss(sector_cache_file):
             if item["ticker"] not in seen_tickers:
                 results.append(item)
                 seen_tickers.add(item["ticker"])
-        log.info("FDA RSS: %d additional events", len(results) - len(seen_tickers) + len(seen_tickers))
+        log.info("FDA RSS: %d additional event(s)", len(seen_tickers) - before)
     except Exception as e:
         log.error("FDA RSS scan failed: %s", e)
 
@@ -184,148 +203,80 @@ def scan_today(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Source 1: Finviz News
+#  Source 1: Today's Biggest Movers (Alpaca) -> Finviz sector + news check
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _scan_finviz_news(sector_cache_file: str) -> List[Dict]:
+# Warrants, units, and other odd tickers (e.g. "ADACW", "MDCXW") tend to
+# dominate the raw movers list with huge, meaningless % swings on thin
+# volume -- filter to plain 1-5 letter ticker symbols only.
+_PLAIN_TICKER_RE = re.compile(r"^[A-Z]{1,5}$")
+
+
+def _scan_big_movers(
+    sector_cache_file: str,
+    api_key: str,
+    secret_key: str,
+    data_url: str,
+    min_pct: float,
+    min_price: float,
+    max_candidates: int,
+) -> List[Dict]:
     """
-    Scrape https://finviz.com/news.ashx for pharma catalyst headlines.
-    Each news item is tagged with one or more stock tickers on Finviz.
+    Find today's biggest % gainers market-wide via Alpaca's screener API --
+    no watchlist needed. Filters out penny stocks and warrants/units, then
+    checks each surviving candidate's Finviz quote page for pharma/biotech
+    sector membership and a classifiable catalyst headline in its own news
+    feed (both of which still work server-side, unlike Finviz's general
+    news page and screener page).
     """
+    headers = {"APCA-API-KEY-ID": api_key, "APCA-API-SECRET-KEY": secret_key}
     try:
         r = requests.get(
-            "https://finviz.com/news.ashx",
-            headers=HEADERS, timeout=15,
+            f"{data_url}/screener/stocks/movers",
+            headers=headers, params={"top": 50}, timeout=15,
         )
         r.raise_for_status()
+        gainers = r.json().get("gainers", [])
     except Exception as e:
-        log.warning("Finviz news fetch: %s", e)
+        log.warning("Alpaca movers fetch failed: %s", e)
         return []
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    results = []
+    checked = 0
 
-    # Finviz news table id="news-table"
-    table = soup.find("table", id="news-table")
-    if not table:
-        log.warning("Finviz: news-table not found -- page structure may have changed")
-        return []
+    for g in gainers:
+        symbol = g.get("symbol", "")
+        price  = g.get("price", 0) or 0
+        pct    = g.get("percent_change", 0) or 0
 
-    results  = []
-    seen     = set()
+        if not _PLAIN_TICKER_RE.match(symbol):
+            continue
+        if price < min_price or pct < min_pct:
+            continue
+        if checked >= max_candidates:
+            break
+        checked += 1
 
-    for row in table.find_all("tr"):
-        cells = row.find_all("td")
-        if not cells:
+        if not _is_pharma_stock(symbol, sector_cache_file):
             continue
 
-        # Combine all cell text for keyword matching
-        row_text = row.get_text(" ", strip=True)
-        headline = ""
-        tickers  = []
-
-        for cell in cells:
-            # News headline
-            for a in cell.find_all("a"):
-                href = a.get("href", "")
-                text = a.get_text(strip=True)
-                if "quote.ashx?t=" in href:
-                    m = re.search(r"t=([A-Z]{1,6})", href)
-                    if m:
-                        tickers.append(m.group(1))
-                elif text and len(text) > 15:
-                    headline = text   # longest non-ticker link = headline
-
-        if not headline:
-            # Fallback: grab the first long text node
-            for a in row.find_all("a"):
-                txt = a.get_text(strip=True)
-                if len(txt) > 20 and "quote.ashx" not in a.get("href", ""):
-                    headline = txt
-                    break
-
-        if not headline or not tickers:
-            continue
-
-        headline_lower = headline.lower()
-        event_type = _classify_event(headline_lower)
+        headline, event_type = _fetch_stock_news_headline(symbol)
         if not event_type:
             continue
 
-        for ticker in tickers:
-            if ticker in seen:
-                continue
-            if not _is_pharma_stock(ticker, sector_cache_file):
-                continue
-            seen.add(ticker)
-            results.append({
-                "ticker":     ticker,
-                "headline":   headline[:200],
-                "event_type": event_type,
-                "source":     "finviz_news",
-            })
-            log.info("  [finviz] %s | %-20s | %s", ticker, event_type, headline[:70])
+        results.append({
+            "ticker":     symbol,
+            "headline":   headline,
+            "event_type": event_type,
+            "source":     "alpaca_movers",
+            "pct_change": pct,
+        })
+        log.info("  [movers] %s | +%.1f%% | %-20s | %s", symbol, pct, event_type, headline[:70])
 
-        time.sleep(0.2)   # be polite
+        time.sleep(0.3)   # be polite to Finviz between per-ticker checks
 
-    return results
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  Source 2: Finviz Biotech Screener
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _scan_finviz_screener() -> List[Dict]:
-    """
-    Fetch Finviz screener for Biotechnology + Drug Manufacturers stocks
-    sorted by highest % change today. Stocks with large moves likely have
-    a catalyst -- fetch their individual news to confirm.
-    """
-    results = []
-    # Two sectors: Biotechnology and Drug Manufacturers - General
-    screener_urls = [
-        "https://finviz.com/screener.ashx?v=111&f=sec_healthcare,ind_biotechnology&o=-change",
-        "https://finviz.com/screener.ashx?v=111&f=sec_healthcare,ind_drugmanufacturersgeneral&o=-change",
-    ]
-
-    seen = set()
-    for url in screener_urls:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=15)
-            r.raise_for_status()
-        except Exception as e:
-            log.warning("Finviz screener fetch failed: %s", e)
-            continue
-
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        # Find screener table rows
-        for a in soup.find_all("a", href=re.compile(r"quote\.ashx\?t=")):
-            m = re.search(r"t=([A-Z]{1,6})", a.get("href", ""))
-            if not m:
-                continue
-            ticker = m.group(1)
-            if ticker in seen:
-                continue
-            seen.add(ticker)
-
-            # Fetch individual stock news to find catalyst
-            headline, event_type = _fetch_stock_news_headline(ticker)
-            if event_type:
-                results.append({
-                    "ticker":     ticker,
-                    "headline":   headline,
-                    "event_type": event_type,
-                    "source":     "finviz_screener",
-                })
-                log.info("  [screener] %s | %-20s | %s", ticker, event_type, headline[:70])
-
-            time.sleep(0.3)
-            if len(results) >= 5:
-                break
-
-        if len(results) >= 5:
-            break
-
+    log.info("Big movers: checked %d candidate(s) (>= %.0f%% gain, >= $%.2f)",
+              checked, min_pct, min_price)
     return results
 
 
@@ -360,7 +311,7 @@ def _fetch_stock_news_headline(ticker: str):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Source 3: FDA Official RSS Feed
+#  Source 2: FDA Official RSS Feed
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _scan_fda_rss(sector_cache_file: str) -> List[Dict]:
@@ -370,7 +321,7 @@ def _scan_fda_rss(sector_cache_file: str) -> List[Dict]:
     """
     rss_url = (
         "https://www.fda.gov/about-fda/contact-fda/stay-informed/"
-        "rss-feeds/fda-press-releases/rss.xml"
+        "rss-feeds/press-releases/rss.xml"
     )
     try:
         r = requests.get(rss_url, headers=HEADERS, timeout=15)

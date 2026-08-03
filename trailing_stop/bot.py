@@ -26,11 +26,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import (
     ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, ALPACA_DATA_URL,
+    ALPACA_SCREENER_URL,
     WATCHED_STOCKS, INITIAL_QTY, LADDER_QTY,
     STOP_LOSS_PCT, TRAIL_TRIGGER_PCT, TRAIL_STOP_PCT, LADDER_IN_DROP_PCT,
     MIN_CASH_BALANCE, STATE_FILE, LOG_DIR, NOTIFY_EMAIL,
     PHARMA_SCAN_ENABLED, PHARMA_MAX_STOCKS, PHARMA_SKIP_EVENTS,
     CATALYST_CACHE, SECTOR_CACHE,
+    MOVERS_MIN_PCT_CHANGE, MOVERS_MIN_PRICE, MOVERS_MAX_CANDIDATES,
 )
 from state_manager import StateManager
 import notifier
@@ -200,6 +202,12 @@ def run():
                 skip_event_types=PHARMA_SKIP_EVENTS,
                 cache_file=CATALYST_CACHE,
                 sector_cache_file=SECTOR_CACHE,
+                alpaca_api_key=ALPACA_API_KEY,
+                alpaca_secret_key=ALPACA_SECRET_KEY,
+                alpaca_data_url=ALPACA_SCREENER_URL,
+                movers_min_pct=MOVERS_MIN_PCT_CHANGE,
+                movers_min_price=MOVERS_MIN_PRICE,
+                movers_max_candidates=MOVERS_MAX_CANDIDATES,
             )
             for cat in catalysts:
                 ticker     = cat["ticker"]
