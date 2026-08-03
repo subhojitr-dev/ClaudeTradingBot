@@ -396,13 +396,18 @@ Runs every **2 hours** (not 30 min — it only needs to check a few times per da
 | Contract | OTM call + put, delta ≈ **0.30**, expiry **~90 DTE** |
 
 ### Exit Rules
+Judges the call + put **together** against total cost, never one leg alone — the
+two legs move opposite each other on the same stock move, so watching only one
+leg (e.g. "sell the call once it's up 15%") misrepresents the position's real
+P&L and can lock in a leg's small gain while leaving the other leg's growing
+loss with no exit plan at all. This check runs at all times, pre- and
+post-earnings alike.
 ```
-PRE-EARNINGS phase (between entry and earnings date):
-  CALL price rises ≥ 15% from entry → sell the CALL, keep the PUT
+Combined value = call leg value + put leg value (locked-in proceeds for any
+                 leg already sold, live mid price for any leg still open)
 
-POST-EARNINGS phase (after earnings date passes):
-  Market runs its course; stock often reverses → PUT gains value
-  PUT price rises ≥ 10% from entry  → sell the PUT → trade fully closed
+  Combined value ≥ +20% of total cost → close both legs, take the profit
+  Combined value ≤ -20% of total cost → close both legs, cut the loss
 ```
 
 ### Stocks Watched
@@ -417,8 +422,9 @@ PANW  COHR  MRVL  RKLB   NBIS
   │  Every 2-hour run                                        │
   ├──────────────────────────────────────────────────────────┤
   │  Phase 1 — Monitor open strangles:                       │
-  │    PRE_EARNINGS:  check call price → sell if +15%        │
-  │    POST_EARNINGS: check put price  → sell if +10%        │
+  │    Judge call + put TOGETHER vs. total cost, always      │
+  │    ≥ +20% combined → close both, take profit             │
+  │    ≤ -20% combined → close both, cut loss                │
   │                                                          │
   │  Phase 2 — Scan for new entries:                         │
   │    For each untraded stock:                              │
@@ -439,7 +445,7 @@ strangle\
   option_selector.py  ← finds ~0.30 delta, ~90 DTE call + put via Alpaca
   state_manager.py    ← persists OPEN / CALL_SOLD / CLOSED states
   alpaca_client.py    ← Alpaca options API wrapper
-  notifier.py         ← email alerts (open, call sold, put sold)
+  notifier.py         ← email alerts (open, combined close, IV skip)
   dashboard.py        ← terminal P&L view (run manually)
   strangle_state.json ← auto-generated live position state
   iv_history.json     ← auto-generated rolling IV history per symbol
@@ -517,8 +523,7 @@ All emails sent to **subhojitr@gmail.com** via Gmail SMTP.
 | Wheel Bot | 70% profit | `[Flywheel] 70% PROFIT – Closed AVGO PUT early` |
 | Wheel Bot | Daily report | `[Flywheel] Daily Report – 2026-05-29` |
 | Strangle Bot | Strangle opened | `[Strangle] OPENED NVDA — earnings 2026-07-23` |
-| Strangle Bot | Call sold pre-earnings | `[Strangle] CALL SOLD NVDA — +18.3% pre-earnings` |
-| Strangle Bot | Put sold post-earnings | `[Strangle] PUT SOLD NVDA — +12.1% post-earnings` |
+| Strangle Bot | Whole position closed | `[Strangle] CLOSED NVDA — combined profit target hit (+21.4%)` |
 | Strangle Bot | IV too high, skipped | `[Strangle] SKIP NVDA — IV too high (73rd pct)` |
 | Daily Top-Up | Low cash | `LOW CASH ALERT – add $X to reach $100,000` |
 
@@ -628,8 +633,8 @@ Net result: if the roll produces a credit → win.
 | Strangle stocks | `strangle/config.py` | `WATCHED_STOCKS` |
 | Strangle earnings window | `strangle/config.py` | `EARNINGS_MIN_DAYS / EARNINGS_MAX_DAYS` |
 | Strangle IV threshold | `strangle/config.py` | `IV_PERCENTILE_THRESHOLD` |
-| Strangle call target | `strangle/config.py` | `CALL_PROFIT_TARGET_PCT` |
-| Strangle put target | `strangle/config.py` | `PUT_PROFIT_TARGET_PCT` |
+| Strangle combined profit target | `strangle/config.py` | `COMBINED_PROFIT_TARGET_PCT` |
+| Strangle combined stop-loss | `strangle/config.py` | `COMBINED_STOP_LOSS_PCT` |
 | Strangle delta target | `strangle/config.py` | `TARGET_DELTA` |
 | Strangle DTE target | `strangle/config.py` | `TARGET_DTE` |
 | Iron Condor DTE | `ironcondor/config.py` | `TARGET_DTE` |

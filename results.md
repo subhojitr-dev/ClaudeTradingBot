@@ -60,8 +60,7 @@ email_archive/
 | Trigger | Subject | When sent |
 |---------|---------|-----------|
 | New strangle entered | `TradingBot: [Strangle] OPENED NVDA — earnings 2026-07-01` | When call + put are purchased 14–21 days before earnings |
-| Call rose 15%+ pre-earnings | `TradingBot: [Strangle] CALL SOLD NVDA — +16.2% pre-earnings` | When call leg hits profit target |
-| Put rose 10%+ post-earnings | `TradingBot: [Strangle] CLOSED NVDA — PROFIT +$312` | When put leg is sold and trade is fully closed |
+| Combined position closed | `TradingBot: [Strangle] CLOSED NVDA — combined profit target hit (+21.4%)` | When call + put together (judged as one position, not either leg alone) move ±20% of total cost, at any time pre- or post-earnings |
 | IV too high to enter | `TradingBot: [Strangle] SKIP NVDA — IV too high (72nd percentile)` | When earnings window is right but IV is elevated |
 | Daily report | `TradingBot: [Strangle] Daily Report — 2026-06-19` | 4:00 PM every trading day |
 

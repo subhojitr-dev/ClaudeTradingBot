@@ -57,7 +57,7 @@ C:\Users\subho\tradingbot\
     ├── option_selector.py               ← Finds ~0.30 delta, ~90 DTE call + put via Alpaca
     ├── state_manager.py                 ← Persists OPEN / CALL_SOLD / CLOSED states
     ├── alpaca_client.py                 ← Options-aware Alpaca API wrapper
-    ├── notifier.py                      ← Email alerts (open, call sold, put sold, IV skip)
+    ├── notifier.py                      ← Email alerts (open, combined close, IV skip)
     ├── dashboard.py                     ← Terminal P&L view (run manually)
     ├── strangle_state.json              ← Live strangle positions (auto-generated)
     ├── iv_history.json                  ← Rolling IV observations per symbol (auto-generated)
@@ -747,8 +747,8 @@ C:\Users\subho\AppData\Local\Python\bin\python3.14.exe report.py >> logs\report.
 | `DTE_TOLERANCE` | 14 | Accept expiries within ±14 days of target |
 | `TARGET_DELTA` | 0.30 | Target OTM delta for both call and put |
 | `DELTA_TOLERANCE` | 0.07 | Accept delta between 0.23 and 0.37 |
-| `CALL_PROFIT_TARGET_PCT` | 0.15 | Sell call pre-earnings if up 15% |
-| `PUT_PROFIT_TARGET_PCT` | 0.10 | Sell put post-earnings if up 10% |
+| `COMBINED_PROFIT_TARGET_PCT` | 0.20 | Close both legs once combined value is +20% of cost |
+| `COMBINED_STOP_LOSS_PCT` | 0.20 | Close both legs once combined value is -20% of cost |
 | `MAX_OPEN_STRANGLES` | 5 | Max simultaneous open strangles |
 | `POLL_HOURS` | 2 | Bot runs every 2 hours (not 30 min) |
 
@@ -759,8 +759,10 @@ C:\Users\subho\AppData\Local\Python\bin\python3.14.exe report.py >> logs\report.
 **Purpose:** Main engine. Runs every 2 hours. Two phases per run:
 
 **Phase 1 — Monitor open strangles** (only stocks already in `strangle_state.json`):
-- PRE_EARNINGS: if call mid price ≥ entry × 1.15 → sell call, keep put
-- POST_EARNINGS (after earnings date passes): if put mid price ≥ entry × 1.10 → sell put → trade closed
+- Judges the call + put **together** against total cost, at all times (pre- or
+  post-earnings alike) — never one leg's price in isolation
+- Combined value ≥ +20% of cost → close whatever legs are still open, trade closed (profit)
+- Combined value ≤ -20% of cost → close whatever legs are still open, trade closed (stop-loss)
 
 **Phase 2 — Scan for new entries** (all watched stocks not already in an open strangle):
 - Calls `earnings_scanner.scan_for_entries()` — stocks with no earnings in the 14–21 day window are **silently skipped**
@@ -803,13 +805,12 @@ C:\Users\subho\AppData\Local\Python\bin\python3.14.exe report.py >> logs\report.
 
 ### `C:\Users\subho\tradingbot\strangle\notifier.py`
 
-**Purpose:** Email alerts specific to the strangle bot. Four alert types:
+**Purpose:** Email alerts specific to the strangle bot. Three alert types:
 
 | Function | Trigger |
 |---|---|
 | `notify_strangle_opened` | New strangle entered (both legs bought) |
-| `notify_call_sold` | Call leg sold pre-earnings at +15% |
-| `notify_put_sold` | Put leg sold post-earnings at +10% — includes final net P&L |
+| `notify_combined_close` | Whole position closed — combined profit target or stop-loss hit, judged on call + put together, includes final net P&L |
 | `notify_iv_skip` | Stock met earnings criteria but IV was too high — skipped |
 
 ---

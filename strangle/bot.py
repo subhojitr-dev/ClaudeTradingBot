@@ -9,12 +9,15 @@ Strategy overview
   2. Confirm stock has historically moved ≥ 4% on at least 4 of last 8 reports
   3. Buy 1 OTM CALL + 1 OTM PUT, both ~0.30 delta, ~90 DTE
 
-PRE-EARNINGS monitoring (every 30 min during market hours):
-  - If CALL price rises 15%+ → sell the call, keep the put
-
-After earnings date passes → POST-EARNINGS phase:
-  - Stock can run, then revert; put gains value
-  - If PUT price rises 10%+ → sell the put → trade fully closed
+Combined-position monitoring (every 30 min during market hours, pre- or
+post-earnings alike):
+  - Judge the call + put TOGETHER against total cost, never one leg alone --
+    the two legs move opposite each other on the same stock move, so
+    watching only one leg misrepresents the position's real P&L.
+  - If combined value is +15% of cost or more → sell whatever legs are
+    still open, trade fully closed (profit).
+  - If combined value is -15% of cost or worse → sell whatever legs are
+    still open, trade fully closed (stop-loss).
 
 Runs every 30 min via Windows Task Scheduler (same window as other bots).
 """
@@ -124,77 +127,90 @@ def try_open_strangle(symbol: str, earnings_date: str, state: dict) -> None:
     )
 
 
-# ── Pre-earnings monitoring ────────────────────────────────────
-
-def monitor_pre_earnings(symbol: str, pos: dict, positions: dict) -> None:
-    """Check if call has hit 15% profit target — sell it if so."""
-    call_occ   = pos["call_contract"]
-    entry      = pos["call_entry_price"]
-
-    # Check whether call is still in our Alpaca positions
-    if call_occ not in positions:
-        log.info("  %s: call %s no longer in positions (may have been filled/expired)", symbol, call_occ)
-        return
-
-    snap       = ac.get_option_snapshot(call_occ)
-    mid        = ac.extract_mid(snap)
-    if mid <= 0:
-        log.info("  %s: call price unavailable", symbol)
-        return
-
-    gain_pct = (mid - entry) / entry
-    log.info("  %s: CALL @ $%.2f vs entry $%.2f → gain %.1f%%",
-             symbol, mid, entry, gain_pct * 100)
-
-    if gain_pct >= config.CALL_PROFIT_TARGET_PCT:
-        log.info("  %s: CALL profit target hit (%.1f%% ≥ %.0f%%) — SELLING CALL",
-                 symbol, gain_pct * 100, config.CALL_PROFIT_TARGET_PCT * 100)
-        try:
-            ac.place_option_order(call_occ, "sell", 1, mid)
-        except Exception as e:
-            log.error("  %s: sell call failed: %s", symbol, e)
-            return
-        sm.record_call_sold(state_ref[0], symbol, mid)
-        notify.notify_call_sold(symbol, call_occ, entry, mid, gain_pct)
-
-
 # Mutable container so monitor helpers can mutate state
 state_ref = [None]
 
 
-# ── Post-earnings monitoring ───────────────────────────────────
+# ── Combined-position monitoring ────────────────────────────────
 
-def monitor_post_earnings(symbol: str, pos: dict, positions: dict) -> None:
-    """Check if put has hit 10% profit target — sell it if so."""
-    put_occ = pos["put_contract"]
-    entry   = pos["put_entry_price"]
+def _leg_value(pos: dict, positions: dict, sold_key: str, contract_key: str):
+    """Return (value_in_dollars, live_mid_or_None, still_open: bool) for one leg.
 
-    if put_occ not in positions:
-        log.info("  %s: put %s no longer in positions — abandoning", symbol, put_occ)
-        sm.abandon(state_ref[0], symbol, "put position disappeared")
-        return
+    Already-sold legs contribute their locked-in proceeds. Still-open legs
+    contribute their current mid price -- or None if the contract isn't in
+    our Alpaca positions at all (expired/exercised/removed unexpectedly).
+    """
+    sold_price = pos.get(sold_key)
+    if sold_price is not None:
+        return sold_price * 100, None, False
 
-    snap = ac.get_option_snapshot(put_occ)
-    mid  = ac.extract_mid(snap)
+    occ = pos[contract_key]
+    if occ not in positions:
+        return None, None, False
+
+    mid = ac.extract_mid(ac.get_option_snapshot(occ))
     if mid <= 0:
-        log.info("  %s: put price unavailable", symbol)
+        return None, None, True
+    return mid * 100, mid, True
+
+
+def monitor_combined(symbol: str, pos: dict, positions: dict) -> None:
+    """Judge the WHOLE position (call + put together) against its total
+    cost, and close whatever legs are still open once it moves +/-
+    COMBINED_PROFIT_TARGET_PCT / COMBINED_STOP_LOSS_PCT -- never decide
+    based on one leg's price in isolation."""
+    call_value, call_mid, call_open = _leg_value(pos, positions, "call_sold_price", "call_contract")
+    put_value,  put_mid,  put_open  = _leg_value(pos, positions, "put_sold_price",  "put_contract")
+
+    if call_value is None or put_value is None:
+        log.info("  %s: a leg's price is unavailable this run -- skipping", symbol)
         return
 
-    gain_pct = (mid - entry) / entry
-    log.info("  %s: PUT @ $%.2f vs entry $%.2f → gain %.1f%%",
-             symbol, mid, entry, gain_pct * 100)
+    total_cost   = pos["total_cost"]
+    current_value = call_value + put_value
+    gain_pct      = (current_value - total_cost) / total_cost if total_cost else 0
 
-    if gain_pct >= config.PUT_PROFIT_TARGET_PCT:
-        log.info("  %s: PUT profit target hit (%.1f%% ≥ %.0f%%) — SELLING PUT",
-                 symbol, gain_pct * 100, config.PUT_PROFIT_TARGET_PCT * 100)
+    log.info(
+        "  %s: combined value $%.2f vs cost $%.2f -> gain %.1f%% (call_open=%s put_open=%s)",
+        symbol, current_value, total_cost, gain_pct * 100, call_open, put_open,
+    )
+
+    if gain_pct >= config.COMBINED_PROFIT_TARGET_PCT:
+        reason = f"combined profit target hit ({gain_pct * 100:+.1f}% >= {config.COMBINED_PROFIT_TARGET_PCT * 100:.0f}%)"
+    elif gain_pct <= -config.COMBINED_STOP_LOSS_PCT:
+        reason = f"combined stop-loss hit ({gain_pct * 100:+.1f}% <= -{config.COMBINED_STOP_LOSS_PCT * 100:.0f}%)"
+    else:
+        return  # nothing to do yet
+
+    log.info("  %s: %s -- CLOSING WHATEVER LEGS ARE STILL OPEN", symbol, reason)
+
+    if call_open:
         try:
-            ac.place_option_order(put_occ, "sell", 1, mid)
+            ac.place_option_order(pos["call_contract"], "sell", 1, call_mid)
+        except Exception as e:
+            log.error("  %s: sell call failed: %s", symbol, e)
+            return
+        sm.record_call_sold(state_ref[0], symbol, call_mid)
+
+    if put_open:
+        try:
+            ac.place_option_order(pos["put_contract"], "sell", 1, put_mid)
         except Exception as e:
             log.error("  %s: sell put failed: %s", symbol, e)
             return
-        sm.record_put_sold(state_ref[0], symbol, mid)
-        s = state_ref[0]["active"].get(symbol, state_ref[0]["history"][-1])
-        notify.notify_put_sold(symbol, put_occ, entry, mid, gain_pct, s.get("net_pnl", 0))
+        sm.record_put_sold(state_ref[0], symbol, put_mid)
+
+    history = state_ref[0]["history"]
+    closed = history[-1] if history else {}
+    notify.notify_combined_close(
+        symbol=symbol,
+        reason=reason,
+        call_sold_price=closed.get("call_sold_price"),
+        put_sold_price=closed.get("put_sold_price"),
+        total_cost=total_cost,
+        total_proceeds=closed.get("total_proceeds", current_value),
+        net_pnl=closed.get("net_pnl", current_value - total_cost),
+    )
 
 
 # ── Main ─────────────────────────────────────────────────────
@@ -236,17 +252,11 @@ def run() -> None:
             pos["phase"] = "POST_EARNINGS"
 
         status = pos["status"]
-        phase  = pos["phase"]
 
-        if status == "OPEN" and phase == "PRE_EARNINGS":
-            monitor_pre_earnings(symbol, pos, positions)
-
-        elif status in ("OPEN", "CALL_SOLD") and phase == "POST_EARNINGS":
-            # If OPEN in post-earnings, the call was never sold — it can still
-            # be sold now too, but our primary focus is the put.
-            if status == "OPEN" and pos["call_contract"] in positions:
-                monitor_pre_earnings(symbol, pos, positions)
-            monitor_post_earnings(symbol, pos, positions)
+        if status in ("OPEN", "CALL_SOLD"):
+            # Same combined-position check whether we're pre- or post-earnings --
+            # phase only matters for other bookkeeping, not for this decision.
+            monitor_combined(symbol, pos, positions)
 
         elif status == "CLOSED":
             # Shouldn't be in active, but clean it up

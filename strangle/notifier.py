@@ -1,9 +1,9 @@
 """notifier.py  --  Rich HTML email alerts for the Strangle bot
 
-Four notification types:
+Three notification types:
   notify_strangle_opened  -- entry with call + put legs and earnings context
-  notify_call_sold        -- call leg closed pre-earnings with P&L
-  notify_put_sold         -- put leg closed post-earnings with full trade P&L
+  notify_combined_close   -- whole position closed (profit target or stop-loss),
+                              judged on call + put together, not either leg alone
   notify_iv_skip          -- skipped entry due to elevated IV
 """
 
@@ -97,20 +97,18 @@ def notify_strangle_opened(
 ) -> None:
     legs_html = f"""
     <table>
-      <tr><th>Leg</th><th>Contract</th><th>Type</th><th>Cost</th><th>Target exit</th></tr>
+      <tr><th>Leg</th><th>Contract</th><th>Type</th><th>Cost</th></tr>
       <tr>
         <td>Buy Call</td>
         <td class="mono">{call}</td>
         <td><span class="pill pill-green">CALL</span></td>
         <td class="mono green">${call_price:.2f}</td>
-        <td>Sell if +15% pre-earnings</td>
       </tr>
       <tr>
         <td>Buy Put</td>
         <td class="mono">{put}</td>
         <td><span class="pill pill-blue">PUT</span></td>
         <td class="mono green">${put_price:.2f}</td>
-        <td>Sell if +10% post-earnings</td>
       </tr>
     </table>"""
 
@@ -130,8 +128,8 @@ def notify_strangle_opened(
 
     <div class="section">
       <div class="section-title">Monitoring Plan</div>
-      {_kv("Pre-earnings", "If CALL rises 15%+ → sell call, lock in gains, hold put")}
-      {_kv("Post-earnings", "If PUT rises 10%+ → sell put → trade fully closed")}
+      {_kv("Rule", "Judge call + put TOGETHER against total cost, not either leg alone")}
+      {_kv("Exit", "Close both legs once combined value is +/-15% of total cost")}
       {_kv("Check frequency", "Every 2 hours during market hours")}
     </div>"""
 
@@ -142,75 +140,46 @@ def notify_strangle_opened(
     )
 
 
-# ── 2. CALL LEG SOLD (pre-earnings) ──────────────────────────────────────────
+# ── 2. COMBINED CLOSE (whole position, either direction) ──────────────────────
 
-def notify_call_sold(
+def notify_combined_close(
     symbol: str,
-    contract: str,
-    entry: float,
-    exit_price: float,
-    gain_pct: float,
-) -> None:
-    pnl       = (exit_price - entry) * 100
-    pnl_sign  = "+" if pnl >= 0 else ""
-    pct_sign  = "+" if gain_pct >= 0 else ""
-    pnl_class = "green" if pnl >= 0 else "red"
-
-    body = f"""
-    <div class="section">
-      <div class="section-title">Call Leg Closed — Pre-Earnings</div>
-      {_kv("Symbol", f"<span class='mono'>{symbol}</span>")}
-      {_kv("Contract", f"<span class='mono'>{contract}</span>")}
-      {_kv("Entry price", f"${entry:.2f}")}
-      {_kv("Exit price",  f"${exit_price:.2f}")}
-      {_kv("Gain",        f"<span class='{pnl_class}'>{pct_sign}{gain_pct:.1%}  ({pnl_sign}${pnl:.2f})</span>")}
-    </div>
-
-    <div class="section">
-      <div class="section-title">What Happens Next</div>
-      <p style="font-size:14px; color:#444; margin:0;">
-        The call leg has been sold to lock in pre-earnings gains.
-        The put leg is still open and will be monitored through the earnings announcement.
-        Target: sell the put if it rises 10% or more post-earnings.
-      </p>
-    </div>"""
-
-    _send(
-        f"TradingBot: [Strangle] CALL SOLD {symbol} — {pct_sign}{gain_pct:.1%} pre-earnings",
-        _wrap(f"Strangle — {symbol} Call Leg Sold",
-              '<span class="pill pill-green">CALL SOLD</span>', body),
-    )
-
-
-# ── 3. PUT LEG SOLD (post-earnings, trade fully closed) ───────────────────────
-
-def notify_put_sold(
-    symbol: str,
-    contract: str,
-    entry: float,
-    exit_price: float,
-    gain_pct: float,
+    reason: str,
+    call_sold_price,
+    put_sold_price,
+    total_cost: float,
+    total_proceeds: float,
     net_pnl: float,
 ) -> None:
     result     = "PROFIT" if net_pnl >= 0 else "LOSS"
     pnl_class  = "green"    if net_pnl >= 0 else "red"
     pill_class = "pill-green" if net_pnl >= 0 else "pill-red"
     pnl_sign   = "+" if net_pnl >= 0 else ""
-    pct_sign   = "+" if gain_pct >= 0 else ""
+
+    legs_html = f"""
+    <table>
+      <tr><th>Leg</th><th>Exit price</th></tr>
+      <tr><td>Call</td><td class="mono">{f"${call_sold_price:.2f}" if call_sold_price is not None else "—"}</td></tr>
+      <tr><td>Put</td><td class="mono">{f"${put_sold_price:.2f}" if put_sold_price is not None else "—"}</td></tr>
+    </table>"""
 
     body = f"""
     <div class="section">
-      <div class="section-title">Put Leg Closed — Post-Earnings</div>
+      <div class="section-title">Whole Position Closed</div>
       {_kv("Symbol", f"<span class='mono'>{symbol}</span>")}
-      {_kv("Contract", f"<span class='mono'>{contract}</span>")}
-      {_kv("Entry price", f"${entry:.2f}")}
-      {_kv("Exit price",  f"${exit_price:.2f}")}
-      {_kv("Put leg gain", f"<span class='{pnl_class}'>{pct_sign}{gain_pct:.1%}</span>")}
+      {_kv("Reason", reason)}
+    </div>
+
+    <div class="section">
+      <div class="section-title">Legs</div>
+      {legs_html}
     </div>
 
     <div class="section">
       <div class="section-title">Final Trade Result</div>
-      {_kv("Net P&amp;L (both legs)",
+      {_kv("Total cost", f"${total_cost:.2f}")}
+      {_kv("Total proceeds", f"${total_proceeds:.2f}")}
+      {_kv("Net P&amp;L (both legs together)",
            f"<span class='{pnl_class}'>{pnl_sign}${abs(net_pnl):.2f}</span>")}
       {_kv("Outcome", f"<span class='{pnl_class}'>{result}</span>")}
       {_kv("Status", "Strangle fully closed — no open legs remaining")}

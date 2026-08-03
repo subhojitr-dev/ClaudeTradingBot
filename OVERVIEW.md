@@ -114,15 +114,19 @@ The entry rules are strict:
 - Options chosen are about 30% out-of-the-money and expire in about 90 days
 
 **Exit plan:**
-- **Before earnings:** If the Call option gains 15% — sell the Call, keep the Put
-- **After earnings:** The stock often makes its big move and then reverses. When the
-  Put gains 10% — sell it. Trade is fully closed.
+- Judges the Call and Put **together** as one position, not one leg at a time — the
+  two always move in opposite directions on the same stock move, so watching only
+  one leg (e.g. "sell the Call once it's up 15%") can lock in a small win on that
+  leg while leaving the other leg's growing loss with no exit plan at all.
+- This combined check runs at all times, before and after earnings alike.
+- **If the combined position is up 20% or more** — close both legs, take the profit.
+- **If the combined position is down 20% or more** — close both legs, cut the loss.
 
 **The stocks it scans:** NVDA, AAPL, MSFT, GOOGL, AVGO, AMD, TSLA, META, AMZN, MU,
 PANW, COHR, MRVL, RKLB, NBIS
 
-**Emails you when:** Strangle opened, call sold pre-earnings, put sold post-earnings,
-IV too high (skipped).
+**Emails you when:** Strangle opened, whole position closed (profit target or
+stop-loss), IV too high (skipped).
 
 ---
 
@@ -772,8 +776,8 @@ strategy. Runs once per day via its own Task Scheduler entry.
 **How it works:** Same constant-file pattern. Key settings: the 15 stocks to
 scan, earnings entry window (14–21 days), IV percentile threshold (50th),
 IV history retention (60 days), historical move filter (≥4% on ≥4 of last 8
-reports), target delta (0.30), target DTE (90), call profit target (15%),
-put profit target (10%), max simultaneous strangles (5), polling interval (2 hrs).
+reports), target delta (0.30), target DTE (90), combined profit target (20%),
+combined stop-loss (20%), max simultaneous strangles (5), polling interval (2 hrs).
 
 ---
 
@@ -787,10 +791,12 @@ Two phases per run: monitor open strangles, then scan for new entries.
 3. Fetches all current Alpaca option positions
 4. **Phase 1 — Monitor:** For every stock in the active state:
    - If today is past the earnings date, switches it to POST_EARNINGS phase
-   - PRE_EARNINGS + call not yet sold → fetches call's current mid price →
-     if gain ≥ 15%, places a sell-to-close order, records in state, emails
-   - POST_EARNINGS → fetches put's current mid price → if gain ≥ 10%, places
-     a sell-to-close order, records in state, emails, archives the trade
+     (bookkeeping only — doesn't change the exit check below)
+   - Judges the call + put **together** against total cost (using locked-in
+     proceeds for any leg already sold) — never one leg's price alone
+   - If combined value is ≥ +20% or ≤ -20% of cost, places sell-to-close
+     order(s) for whatever legs are still open, records in state, emails,
+     archives the trade
 5. **Phase 2 — Scan:** For each watched stock not already in an open strangle:
    - Calls `earnings_scanner.scan_for_entries()` — if earnings are not 14–21
      days away, the stock is silently skipped (this is the most common outcome)
@@ -892,10 +898,11 @@ Alpaca snapshot JSON into simple floats. Option buy orders use `side: "buy"`
 `notifier.py` because the strangle bot uses a different account and different
 subject-line prefix (`[Strangle]`).
 
-**How it works:** Same Gmail SMTP mechanics as the root notifier. Four alert
-functions: `notify_strangle_opened` (both legs entered), `notify_call_sold`
-(pre-earnings profit), `notify_put_sold` (post-earnings profit, includes final
-net P&L), `notify_iv_skip` (criteria met but IV was elevated — skipped).
+**How it works:** Same Gmail SMTP mechanics as the root notifier. Three alert
+functions: `notify_strangle_opened` (both legs entered), `notify_combined_close`
+(whole position closed — profit target or stop-loss, judged on call + put
+together, includes final net P&L), `notify_iv_skip` (criteria met but IV was
+elevated — skipped).
 
 ---
 
@@ -1037,5 +1044,5 @@ dashboard in your browser automatically.
 | Change wheel early-close % | `flywheel/config.py` → `EARLY_CLOSE_PROFIT_PCT` |
 | Add or remove a strangle stock | `strangle/config.py` → `WATCHED_STOCKS` |
 | Change strangle earnings window | `strangle/config.py` → `EARNINGS_MIN_DAYS`, `EARNINGS_MAX_DAYS` |
-| Change strangle profit targets | `strangle/config.py` → `CALL_PROFIT_TARGET_PCT`, `PUT_PROFIT_TARGET_PCT` |
+| Change strangle profit/stop-loss target | `strangle/config.py` → `COMBINED_PROFIT_TARGET_PCT`, `COMBINED_STOP_LOSS_PCT` |
 | Change notification email address | `config.py` in each strategy folder → `NOTIFY_EMAIL` |
