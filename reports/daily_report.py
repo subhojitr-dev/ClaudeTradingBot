@@ -1,8 +1,8 @@
 """
-daily_report.py  --  Consolidated end-of-day trade ledger across all 5 strategies
+daily_report.py  --  Consolidated end-of-day trade ledger across all 6 strategies
 ===================================================================================
 Run once per day after market close (Task Scheduler, 4:05 PM ET). Builds one row
-per trade across Trailing Stop, Copy Trade, Flywheel, Strangle, and Iron Condor,
+per trade across Trailing Stop, Pharma Scan, Copy Trade, Flywheel, Strangle, and Iron Condor,
 reading each bot's own state JSON (read-only -- never touches a bot's state) plus
 live prices from Alpaca.
 
@@ -187,24 +187,63 @@ def make_row(strategy, symbol, trade_type, status, opened_at, qty, entry_price,
     }
 
 
+# ── Pharma Scan registry ─────────────────────────────────────────────────────────
+# The pharma/FDA catalyst scanner (trailing_stop/pharma_catalyst.py) feeds tickers into
+# the Trailing Stop bot's watch list, so those positions live in trailing_stop_state.json
+# alongside the 15 hand-picked stocks. To report them as their own "PharmaScan" strategy
+# we remember every ticker the scanner ever added -- parsed from the Trailing Stop logs
+# and the archived alert emails, and persisted so log/email cleanup never loses it.
+
+PHARMA_REGISTRY = os.path.join(REPORTS_DIR, "pharma_registry.json")
+_PHARMA_LOG_RE = re.compile(r"PHARMA CATALYST >> Adding ([A-Z.]+) to watch list")
+_PHARMA_MAIL_RE = re.compile(r"TradingBot_TrailingStop_PHARMA_CATALYST_([A-Z.]+)_added")
+
+
+def load_pharma_symbols() -> set:
+    found = set(load_json(PHARMA_REGISTRY, []))
+    log_dir = os.path.join(ROOT, "trailing_stop", "logs")
+    if os.path.isdir(log_dir):
+        for name in os.listdir(log_dir):
+            if name.endswith(".log"):
+                with open(os.path.join(log_dir, name), encoding="utf-8", errors="ignore") as f:
+                    found.update(_PHARMA_LOG_RE.findall(f.read()))
+    mail_dir = os.path.join(ROOT, "email_archive")
+    if os.path.isdir(mail_dir):
+        for week in os.listdir(mail_dir):
+            wdir = os.path.join(mail_dir, week)
+            if os.path.isdir(wdir):
+                for name in os.listdir(wdir):
+                    m = _PHARMA_MAIL_RE.search(name)
+                    if m:
+                        found.add(m.group(1))
+    with open(PHARMA_REGISTRY, "w", encoding="utf-8") as f:
+        json.dump(sorted(found), f)
+    return found
+
+
 # ── Strategy 1: Trailing Stop ─────────────────────────────────────────────────────
 
 def build_trailing_stop_rows() -> dict:
     rows = {}
+    pharma = load_pharma_symbols()
     state = load_json(os.path.join(ROOT, "trailing_stop", "trailing_stop_state.json"), {})
     for symbol, s in state.items():
         entry = s.get("entry_price")
         if entry is None:
             continue
         qty = s.get("total_shares", 0)
-        trade_id = f"TS-{symbol}"
+        is_pharma = symbol in pharma
+        strat = "PharmaScan" if is_pharma else "TrailingStop"
+        note = ("Pharma/FDA catalyst scan -> trailing stop" if is_pharma
+                else "Trailing stop + ladder-in strategy")
+        trade_id = f"{'PH' if is_pharma else 'TS'}-{symbol}"
         if s.get("status") == "active":
             cur = get_stock_price(A_DATA, A_HEADERS, symbol)
             gain_d = (cur - entry) * qty
             gain_p = (cur - entry) / entry * 100 if entry else 0
             rows[trade_id] = make_row(
-                "TrailingStop", symbol, "stock", "OPEN", None, qty, entry, cur, gain_d, gain_p,
-                notes="Trailing stop + ladder-in strategy",
+                strat, symbol, "stock", "OPEN", None, qty, entry, cur, gain_d, gain_p,
+                notes=note,
             )
         else:
             sell_orders = [o for o in s.get("orders", []) if o.get("type") == "stop_loss_sell"]
@@ -214,9 +253,9 @@ def build_trailing_stop_rows() -> dict:
             gain_d = (exit_price - entry) * qty
             gain_p = (exit_price - entry) / entry * 100 if entry else 0
             rows[trade_id] = make_row(
-                "TrailingStop", symbol, "stock", "CLOSED", None, qty, entry, exit_price, gain_d, gain_p,
+                strat, symbol, "stock", "CLOSED", None, qty, entry, exit_price, gain_d, gain_p,
                 closed_at=closed_at, close_reason="Stop-loss hit",
-                notes="Trailing stop + ladder-in strategy",
+                notes=note,
             )
     return rows
 
@@ -564,6 +603,15 @@ def main():
     os.makedirs(REPORTS_DIR, exist_ok=True)
     ledger = load_json(LEDGER_JSON, {})
     existing_trades = ledger.get("trades", {})
+
+    # One-time/idempotent migration: frozen Trailing Stop rows that came from the pharma
+    # scanner are re-labelled PharmaScan (TS-XXX -> PH-XXX).
+    pharma = load_pharma_symbols()
+    for tid in [t for t in existing_trades if t.startswith("TS-") and t[3:] in pharma]:
+        row = existing_trades.pop(tid)
+        row["strategy"] = "PharmaScan"
+        row["notes"] = "Pharma/FDA catalyst scan -> trailing stop"
+        existing_trades["PH-" + tid[3:]] = row
 
     all_new = {}
     for name, builder, args in [
