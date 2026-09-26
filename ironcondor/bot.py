@@ -130,12 +130,18 @@ def try_open_condor(symbol: str, state: dict, sym_cfg: dict) -> None:
 
     legs["spy_price"] = price   # stored as entry price in state
 
-    log.info("  [%s] Placing 4 orders...", symbol)
+    log.info("  [%s] Placing condor as one multi-leg order...", symbol)
     try:
-        ac.place_option_order(legs["short_put"],  "sell", config.CONDOR_QTY, legs["short_put_credit"])
-        ac.place_option_order(legs["long_put"],   "buy",  config.CONDOR_QTY, legs["long_put_debit"])
-        ac.place_option_order(legs["short_call"], "sell", config.CONDOR_QTY, legs["short_call_credit"])
-        ac.place_option_order(legs["long_call"],  "buy",  config.CONDOR_QTY, legs["long_call_debit"])
+        ac.place_mleg_order(
+            [
+                {"symbol": legs["short_put"],  "side": "sell", "intent": "sell_to_open"},
+                {"symbol": legs["long_put"],   "side": "buy",  "intent": "buy_to_open"},
+                {"symbol": legs["short_call"], "side": "sell", "intent": "sell_to_open"},
+                {"symbol": legs["long_call"],  "side": "buy",  "intent": "buy_to_open"},
+            ],
+            config.CONDOR_QTY,
+            legs["net_credit"],
+        )
     except Exception as e:
         log.error("  [%s] Order placement failed: %s", symbol, e)
         return
@@ -192,10 +198,16 @@ def _close_condor(symbol: str, state: dict, pos: dict, reason: str) -> None:
     log.info("  [%s] Closing condor: %s", symbol, reason)
     cost = _current_cost_to_close(pos)
     try:
-        ac.place_option_order(pos["short_put"],  "buy",  config.CONDOR_QTY, cost / 2)
-        ac.place_option_order(pos["long_put"],   "sell", config.CONDOR_QTY, 0.01)
-        ac.place_option_order(pos["short_call"], "buy",  config.CONDOR_QTY, cost / 2)
-        ac.place_option_order(pos["long_call"],  "sell", config.CONDOR_QTY, 0.01)
+        ac.place_mleg_order(
+            [
+                {"symbol": pos["short_put"],  "side": "buy",  "intent": "buy_to_close"},
+                {"symbol": pos["long_put"],   "side": "sell", "intent": "sell_to_close"},
+                {"symbol": pos["short_call"], "side": "buy",  "intent": "buy_to_close"},
+                {"symbol": pos["long_call"],  "side": "sell", "intent": "sell_to_close"},
+            ],
+            config.CONDOR_QTY,
+            -cost,          # closing costs `cost` per share -> net debit
+        )
     except Exception as e:
         log.error("  [%s] Close orders failed: %s", symbol, e)
         return
@@ -289,10 +301,16 @@ def _roll_side(symbol: str, state: dict, pos: dict, side: str, price: float) -> 
         return
 
     try:
-        ac.place_option_order(old_short_occ,         "buy",  config.CONDOR_QTY, old_short_ask)
-        ac.place_option_order(old_long_occ,          "sell", config.CONDOR_QTY, max(old_long_bid, 0.01))
-        ac.place_option_order(new_short_c["symbol"], "sell", config.CONDOR_QTY, new_short_bid)
-        ac.place_option_order(new_long_c["symbol"],  "buy",  config.CONDOR_QTY, new_long_ask)
+        ac.place_mleg_order(
+            [
+                {"symbol": old_short_occ,         "side": "buy",  "intent": "buy_to_close"},
+                {"symbol": old_long_occ,          "side": "sell", "intent": "sell_to_close"},
+                {"symbol": new_short_c["symbol"], "side": "sell", "intent": "sell_to_open"},
+                {"symbol": new_long_c["symbol"],  "side": "buy",  "intent": "buy_to_open"},
+            ],
+            config.CONDOR_QTY,
+            net_roll,
+        )
     except Exception as e:
         log.error("  [%s] Roll orders failed: %s", symbol, e)
         return

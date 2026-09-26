@@ -197,3 +197,48 @@ def place_option_order(
         log.error("  Order FAILED %s: %s", r.status_code, r.text[:300])
         r.raise_for_status()
     return r.json()
+
+
+def place_mleg_order(legs: list, qty: int, net_price: float) -> dict:
+    """
+    Place ONE atomic multi-leg (spread / condor) limit order.
+
+    legs      -- [{"symbol": occ, "side": "buy"|"sell", "intent": "buy_to_open"|...}, ...]
+    qty       -- number of spreads/condors (each leg has ratio_qty 1)
+    net_price -- NET price per share. Positive = we RECEIVE a credit, negative = we PAY a debit
+                 (Alpaca's own convention is the reverse -- positive limit_price = debit --
+                 so the sign is flipped here).
+
+    Unlike four separate leg orders, Alpaca margins a multi-leg order as a defined-risk
+    position (max loss = wing width - credit), so a short put is never treated as an
+    uncovered cash-secured put needing the full strike x100 in buying power. It is also
+    all-or-nothing: no half-filled condor.
+    """
+    payload = {
+        "order_class":   "mleg",
+        "qty":           qty,
+        "type":          "limit",
+        "time_in_force": "day",
+        "limit_price":   round(-net_price, 2),
+        "legs": [
+            {
+                "symbol":          l["symbol"],
+                "ratio_qty":       1,
+                "side":            l["side"],
+                "position_intent": l["intent"],
+            }
+            for l in legs
+        ],
+    }
+    log.info("  MLEG ORDER x%d  net %s $%.2f  legs=%s",
+             qty, "credit" if net_price >= 0 else "debit", abs(net_price),
+             [(l["side"], l["symbol"]) for l in legs])
+    r = requests.post(f"{ALPACA_BASE_URL}/orders", headers=HEADERS, json=payload, timeout=10)
+    if not r.ok:
+        log.error("  MLEG order FAILED %s: %s", r.status_code, r.text[:400])
+        r.raise_for_status()
+    return r.json()
+
+
+def cancel_order(order_id: str) -> None:
+    requests.delete(f"{ALPACA_BASE_URL}/orders/{order_id}", headers=HEADERS, timeout=10)
