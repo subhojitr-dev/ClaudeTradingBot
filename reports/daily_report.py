@@ -273,6 +273,111 @@ def build_trailing_stop_rows() -> dict:
     return rows
 
 
+# ── Pharma Scan monitoring results ────────────────────────────────────────────────
+# For every catalyst the scanner flagged: when it was added, the price then, the
+# biggest rise and biggest fall from that price since, today's price, and whether
+# the bot bought it.
+
+TS_LOG_DIR = os.path.join(ROOT, "trailing_stop", "logs")
+_PHARMA_ADD_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+\s+INFO\s+PHARMA CATALYST >> Adding ([A-Z.]+) to watch list \| (\w+) \| (.*)$")
+_PHARMA_SKIP_RE = re.compile(r"Skipping initial buy of ([A-Z.]+) -- (.+)$")
+
+
+def _pharma_catalyst_events() -> dict:
+    """First 'PHARMA CATALYST >> Adding X' log line per symbol (the scanner repeats
+    it every run that day), plus why an initial buy was skipped, if it was.
+    Only log lines count -- test emails (e.g. MRNA from test_notifications.py) don't."""
+    events, skips = {}, {}
+    try:
+        files = sorted(f for f in os.listdir(TS_LOG_DIR) if f.startswith("trailing_") and f.endswith(".log"))
+    except OSError:
+        return {}
+    for fname in files:
+        with open(os.path.join(TS_LOG_DIR, fname), encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = _PHARMA_ADD_RE.match(line.strip())
+                if m and m.group(2) not in events:
+                    events[m.group(2)] = {"added_at": m.group(1), "catalyst": m.group(3), "headline": m.group(4).strip()}
+                    continue
+                m = _PHARMA_SKIP_RE.search(line)
+                if m and m.group(1) in events:
+                    skips.setdefault(m.group(1), m.group(2).strip())
+    for sym, reason in skips.items():
+        events[sym]["skip_reason"] = reason
+    return events
+
+
+def _bars(symbol: str, timeframe: str, start: str, end: str | None = None) -> list:
+    """Bars from the consolidated SIP feed (IEX alone is too thin for small-cap
+    biotechs). The free data plan only serves SIP data older than 15 minutes."""
+    latest = (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat()
+    end = min(end, latest) if end else latest
+    for feed in ("sip", "iex"):
+        params = {"timeframe": timeframe, "start": start, "end": end, "feed": feed,
+                  "limit": 10000, "adjustment": "split"}
+        r = requests.get(f"{A_DATA}/stocks/{symbol}/bars", headers=A_HEADERS, params=params, timeout=15)
+        if r.ok:
+            return r.json().get("bars") or []
+    r.raise_for_status()
+    return []
+
+
+def build_pharma_watch() -> dict:
+    """symbol -> monitoring results since the catalyst was flagged."""
+    out = {}
+    for sym, ev in _pharma_catalyst_events().items():
+        try:
+            added_local = datetime.strptime(ev["added_at"], "%Y-%m-%d %H:%M:%S")
+            added_utc = added_local.astimezone(timezone.utc)  # logs are in this PC's local time
+            add_day = added_local.date().isoformat()
+            # Price when flagged: last 1-min bar at or before the alert.
+            pre = _bars(sym, "1Min", (added_utc - timedelta(minutes=30)).isoformat(), added_utc.isoformat())
+            day_bars = _bars(sym, "1Day", add_day)
+            if not day_bars:
+                continue
+            price_at_add = pre[-1]["c"] if pre else day_bars[0]["o"]
+            # Highest price after the alert: rest of the alert day (minute bars), then daily highs.
+            after = _bars(sym, "15Min", added_utc.isoformat(), (added_utc + timedelta(hours=10)).isoformat())
+            later = [b for b in after if b["t"][:10] == add_day] + [b for b in day_bars if b["t"][:10] > add_day]
+            high, high_date = max(((b["h"], b["t"][:10]) for b in later), default=(price_at_add, add_day))
+            low, low_date = min(((b["l"], b["t"][:10]) for b in later), default=(price_at_add, add_day))
+            current = day_bars[-1]["c"]
+            out[sym] = {
+                **ev,
+                "price_at_add": round(price_at_add, 4),
+                "high_since_add": round(high, 4),
+                "high_date": high_date,
+                "high_pct": round((high / price_at_add - 1) * 100, 2),
+                "low_since_add": round(low, 4),
+                "low_date": low_date,
+                "low_pct": round((low / price_at_add - 1) * 100, 2),
+                "current_price": round(current, 4),
+                "current_pct": round((current / price_at_add - 1) * 100, 2),
+                "as_of": day_bars[-1]["t"][:10],
+            }
+        except Exception as e:
+            log.warning("PharmaScan watch: %s failed (%s)", sym, e)
+    return out
+
+
+def apply_pharma_watch(merged: dict, watch: dict) -> None:
+    """Attach monitoring results to the PharmaScan position row, or add a
+    watch-only row for catalysts the bot never bought."""
+    for sym, w in watch.items():
+        row = merged.get(f"PH-{sym}")
+        w = {**w, "bought": row is not None}
+        if row is not None:
+            row["pharma_watch"] = w
+            continue
+        merged[f"PHW-{sym}"] = {
+            **make_row("PharmaScan", sym, "watch_only", "WATCHED", w["added_at"][:10], 0,
+                       w["price_at_add"], w["current_price"], 0.0, w["current_pct"],
+                       notes=f"Not bought: {w.get('skip_reason', 'no entry')}"),
+            "pharma_watch": w,
+        }
+
+
 # ── Strategy 2: Copy Trade ────────────────────────────────────────────────────────
 
 def build_copytrade_rows(existing_ledger: dict) -> dict:
@@ -636,7 +741,7 @@ def write_csv(trades: dict):
         w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         w.writeheader()
         for trade_id, row in sorted(trades.items(), key=sort_key):
-            csv_row = {k: v for k, v in row.items() if k not in ("legs", "risk_metrics")}
+            csv_row = {k: v for k, v in row.items() if k not in ("legs", "risk_metrics", "pharma_watch")}
             w.writerow({"trade_id": trade_id, **csv_row})
 
 
@@ -710,6 +815,10 @@ def main():
             log.error("%s: failed to build rows (%s) -- skipping this strategy this run", name, e, exc_info=True)
 
     merged = merge_rows(existing_trades, all_new)
+    try:
+        apply_pharma_watch(merged, build_pharma_watch())
+    except Exception as e:
+        log.error("PharmaScan watch: failed (%s) -- skipping this run", e, exc_info=True)
     merged = prune_old_closed(merged)
 
     ledger = {"generated_at": now_iso(), "trades": merged}
