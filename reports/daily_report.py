@@ -11,7 +11,7 @@ Behaviour:
     overwritten every run.
   - Once a trade is detected closed, its row is written ONE final time (frozen
     values, closed_at set) and is never touched again on subsequent runs.
-  - Closed trades older than RETENTION_DAYS (60) are dropped from the ledger
+  - Closed trades older than RETENTION_DAYS (365) are dropped from the ledger
     entirely on the next run -- open trades are never pruned regardless of age.
 
 Outputs (this folder):
@@ -71,7 +71,7 @@ B_DATA = "https://data.alpaca.markets/v2"
 B_OPT = "https://data.alpaca.markets/v1beta1"
 B_HEADERS = {"APCA-API-KEY-ID": B_KEY, "APCA-API-SECRET-KEY": B_SECRET}
 
-RETENTION_DAYS = 60  # closed trades older than this are dropped from the ledger
+RETENTION_DAYS = 365  # closed trades older than this are dropped from the ledger
 
 TRAILING_STOP_WATCHLIST = {
     "GOOGL", "COHR", "MU", "AVGO", "NBIS", "KTOS", "RKLB", "GLW", "NVDA", "AMD",
@@ -168,7 +168,7 @@ def get_option_mid(options_data_url: str, headers: dict, occ_symbol: str) -> flo
 # ── Row builder ──────────────────────────────────────────────────────────────────
 
 def make_row(strategy, symbol, trade_type, status, opened_at, qty, entry_price,
-             current_price, gain_dollars, gain_pct, closed_at=None, close_reason=None, notes=""):
+             current_price, gain_dollars, gain_pct, closed_at=None, close_reason=None, notes="", legs=None, risk_metrics=None):
     return {
         "strategy": strategy,
         "symbol": symbol,
@@ -184,6 +184,8 @@ def make_row(strategy, symbol, trade_type, status, opened_at, qty, entry_price,
         "closed_at": closed_at,
         "close_reason": close_reason,
         "notes": notes,
+        **({"legs": legs} if legs is not None else {}),
+        **({"risk_metrics": risk_metrics} if risk_metrics is not None else {}),
     }
 
 
@@ -241,9 +243,20 @@ def build_trailing_stop_rows() -> dict:
             cur = get_stock_price(A_DATA, A_HEADERS, symbol)
             gain_d = (cur - entry) * qty
             gain_p = (cur - entry) / entry * 100 if entry else 0
+            stop_price = s.get("stop_price") or round(entry * 0.90, 4)
+            ts_risk = {
+                "stop_loss_pct": 10.0,
+                "stop_loss_price": round(stop_price, 4),
+                "stop_loss_dollars": round((stop_price - entry) * qty, 2),
+                "trailing_trigger_pct": 10.0,
+                "trailing_stop_pct": 5.0,
+                "trailing_active": bool(s.get("trailing_active")),
+                "highest_price": s.get("highest_price"),
+            }
             rows[trade_id] = make_row(
                 strat, symbol, "stock", "OPEN", None, qty, entry, cur, gain_d, gain_p,
                 notes=note,
+                risk_metrics=ts_risk,
             )
         else:
             sell_orders = [o for o in s.get("orders", []) if o.get("type") == "stop_loss_sell"]
@@ -444,10 +457,23 @@ def build_strangle_rows() -> dict:
         total_cost = pos.get("total_cost", 0)
         gain_d = current_value - total_cost
         gain_p = gain_d / total_cost * 100 if total_cost else 0
+        str_legs = [
+            {"role": "Long Call", "side": "long", "type": "CALL", "strike": pos.get("call_strike"), "premium": pos.get("call_entry_price"), "current": mids.get(pos.get("call_contract"), 0) if pos.get("call_sold_price") is None else pos.get("call_sold_price")},
+            {"role": "Long Put",  "side": "long", "type": "PUT",  "strike": pos.get("put_strike"),  "premium": pos.get("put_entry_price"),  "current": mids.get(pos.get("put_contract"),  0) if pos.get("put_sold_price")  is None else pos.get("put_sold_price")},
+        ]
+        str_risk = {
+            "total_cost": round(total_cost / 100, 4),
+            "profit_target_pct": 20.0,
+            "profit_target_dollars": round(total_cost * 0.20 / 100, 2),
+            "stop_loss_pct": 20.0,
+            "stop_loss_dollars": round(total_cost * 0.20 / 100, 2),
+        }
         rows[trade_id] = make_row(
             "Strangle", symbol, "strangle", "OPEN", pos.get("entry_date"), 1,
             total_cost / 100, current_value / 100, gain_d, gain_p,
             notes=f"phase={pos.get('phase')} status={pos.get('status')} earnings={pos.get('earnings_date')}",
+            legs=str_legs,
+            risk_metrics=str_risk,
         )
 
     for pos in state.get("history", []):
@@ -456,12 +482,19 @@ def build_strangle_rows() -> dict:
         net_pnl = pos.get("net_pnl", 0) or 0
         cost = pos.get("total_cost", 0) or 0
         gain_p = net_pnl / cost * 100 if cost else 0
+        closed_str_legs = [
+            {"role": "Long Call", "side": "long", "type": "CALL", "strike": pos.get("call_strike"), "premium": pos.get("call_entry_price"), "current": pos.get("call_sold_price")},
+            {"role": "Long Put",  "side": "long", "type": "PUT",  "strike": pos.get("put_strike"),  "premium": pos.get("put_entry_price"),  "current": pos.get("put_sold_price")},
+        ]
         rows[trade_id] = make_row(
             "Strangle", sym, "strangle", "CLOSED", pos.get("entry_date"), 1,
             cost / 100, (cost + net_pnl) / 100, net_pnl, gain_p,
             closed_at=pos.get("put_sold_date") or pos.get("call_sold_date"),
-            close_reason=pos.get("abandon_reason") or "Both legs closed",
-            notes=f"earnings={pos.get('earnings_date')}",
+            close_reason=pos.get("abandon_reason") or pos.get("close_reason") or "Both legs closed",
+            notes=f"earnings={pos.get('earnings_date')}"
+                  + (f" stock_entry={pos['entry_stock_price']}" if pos.get("entry_stock_price") else "")
+                  + (f" stock_exit={pos['exit_stock_price']}" if pos.get("exit_stock_price") else ""),
+            legs=closed_str_legs,
         )
     return rows
 
@@ -484,10 +517,45 @@ def build_ironcondor_rows() -> dict:
         pnl_per_share = net_credit - cost_to_close
         gain_d = pnl_per_share * 100
         gain_p = pnl_per_share / net_credit * 100 if net_credit else 0
+        ic_legs = [
+            {"role": "Short Put",  "side": "short", "type": "PUT",  "strike": pos.get("short_put_strike"),  "premium": pos.get("short_put_credit"),  "current": mids.get(pos.get("short_put"),  0)},
+            {"role": "Long Put",   "side": "long",  "type": "PUT",  "strike": pos.get("long_put_strike"),   "premium": pos.get("long_put_debit"),    "current": mids.get(pos.get("long_put"),   0)},
+            {"role": "Short Call", "side": "short", "type": "CALL", "strike": pos.get("short_call_strike"), "premium": pos.get("short_call_credit"), "current": mids.get(pos.get("short_call"), 0)},
+            {"role": "Long Call",  "side": "long",  "type": "CALL", "strike": pos.get("long_call_strike"),  "premium": pos.get("long_call_debit"),   "current": mids.get(pos.get("long_call"),  0)},
+        ]
+        put_spread_width = abs((pos.get("short_put_strike") or 0) - (pos.get("long_put_strike") or 0))
+        call_spread_width = abs((pos.get("long_call_strike") or 0) - (pos.get("short_call_strike") or 0))
+        wing_width = max(put_spread_width, call_spread_width) or 5
+        max_loss_per_share = round(wing_width - net_credit, 4) if net_credit else None
+        profit_target_credit = round(net_credit * 0.50, 4)
+        stop_loss_credit = round(net_credit * 2.0, 4)
+        expiry = pos.get("expiry")
+        days_to_expiry = None
+        if expiry:
+            try:
+                days_to_expiry = (date.fromisoformat(expiry) - date.today()).days
+            except ValueError:
+                pass
+        ic_risk = {
+            "net_credit": round(net_credit, 4),
+            "profit_target_credit": profit_target_credit,
+            "profit_target_dollars": round(profit_target_credit * 100, 2),
+            "stop_loss_credit": stop_loss_credit,
+            "stop_loss_dollars": round(stop_loss_credit * 100, 2),
+            "max_loss_per_share": max_loss_per_share,
+            "max_loss_dollars": round(max_loss_per_share * 100, 2) if max_loss_per_share is not None else None,
+            "wing_width": wing_width,
+            "short_put_strike": pos.get("short_put_strike"),
+            "short_call_strike": pos.get("short_call_strike"),
+            "expiry": expiry,
+            "days_to_expiry": days_to_expiry,
+        }
         rows[trade_id] = make_row(
             "IronCondor", symbol, "iron_condor", "OPEN", pos.get("entry_date"), 1,
             net_credit, cost_to_close, gain_d, gain_p,
             notes=f"short {pos.get('short_put_strike')}P/{pos.get('short_call_strike')}C exp {pos.get('expiry')}",
+            legs=ic_legs,
+            risk_metrics=ic_risk,
         )
 
     for pos in state.get("history", []):
@@ -496,11 +564,18 @@ def build_ironcondor_rows() -> dict:
         net_credit = pos.get("net_credit", 0)
         net_pnl = pos.get("net_pnl", 0) or 0
         gain_p = net_pnl / (net_credit * 100) * 100 if net_credit else 0
+        closed_ic_legs = [
+            {"role": "Short Put",  "side": "short", "type": "PUT",  "strike": pos.get("short_put_strike"),  "premium": pos.get("short_put_credit")},
+            {"role": "Long Put",   "side": "long",  "type": "PUT",  "strike": pos.get("long_put_strike"),   "premium": pos.get("long_put_debit")},
+            {"role": "Short Call", "side": "short", "type": "CALL", "strike": pos.get("short_call_strike"), "premium": pos.get("short_call_credit")},
+            {"role": "Long Call",  "side": "long",  "type": "CALL", "strike": pos.get("long_call_strike"),  "premium": pos.get("long_call_debit")},
+        ] if pos.get("short_put_strike") else None
         rows[trade_id] = make_row(
             "IronCondor", symbol, "iron_condor", "CLOSED", pos.get("entry_date"), 1,
             net_credit, pos.get("close_credit", 0), net_pnl, gain_p,
             closed_at=pos.get("close_date"), close_reason=pos.get("close_reason"),
             notes=f"exp {pos.get('expiry')}",
+            legs=closed_ic_legs,
         )
     return rows
 
@@ -556,7 +631,8 @@ def write_csv(trades: dict):
         w = csv.DictWriter(f, fieldnames=CSV_FIELDS)
         w.writeheader()
         for trade_id, row in sorted(trades.items(), key=sort_key):
-            w.writerow({"trade_id": trade_id, **row})
+            csv_row = {k: v for k, v in row.items() if k not in ("legs", "risk_metrics")}
+            w.writerow({"trade_id": trade_id, **csv_row})
 
 
 def write_html(trades: dict):

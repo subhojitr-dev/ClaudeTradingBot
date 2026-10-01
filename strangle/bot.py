@@ -14,9 +14,9 @@ post-earnings alike):
   - Judge the call + put TOGETHER against total cost, never one leg alone --
     the two legs move opposite each other on the same stock move, so
     watching only one leg misrepresents the position's real P&L.
-  - If combined value is +15% of cost or more → sell whatever legs are
+  - If combined value is +20% of cost or more → sell whatever legs are
     still open, trade fully closed (profit).
-  - If combined value is -15% of cost or worse → sell whatever legs are
+  - If combined value is -20% of cost or worse → sell whatever legs are
     still open, trade fully closed (stop-loss).
 
 Runs every 30 min via Windows Task Scheduler (same window as other bots).
@@ -112,7 +112,10 @@ def try_open_strangle(symbol: str, earnings_date: str, state: dict) -> None:
         log.error("  %s: order placement failed: %s", symbol, e)
         return
 
-    sm.open_strangle(state, symbol, legs, earnings_date)
+    sm.open_strangle(state, symbol, legs, earnings_date, stock_price=price)
+    # Save right away: a later step in this run (e.g. a hung earnings scan)
+    # must not be able to lose the record of orders already placed.
+    sm.save(config.STATE_FILE, state)
 
     notify.notify_strangle_opened(
         symbol, earnings_date,
@@ -184,6 +187,15 @@ def monitor_combined(symbol: str, pos: dict, positions: dict) -> None:
 
     log.info("  %s: %s -- CLOSING WHATEVER LEGS ARE STILL OPEN", symbol, reason)
 
+    # Record why and at what stock price we exited (pos is the same dict that
+    # gets archived to history, so these fields travel with the trade).
+    try:
+        pos["exit_stock_price"] = round(ac.get_stock_price(symbol), 2) or None
+    except Exception as e:
+        log.error("  %s: could not fetch stock price for exit record: %s", symbol, e)
+        pos["exit_stock_price"] = None
+    pos["close_reason"] = reason
+
     if call_open:
         try:
             ac.place_option_order(pos["call_contract"], "sell", 1, call_mid)
@@ -199,6 +211,10 @@ def monitor_combined(symbol: str, pos: dict, positions: dict) -> None:
             log.error("  %s: sell put failed: %s", symbol, e)
             return
         sm.record_put_sold(state_ref[0], symbol, put_mid)
+
+    # Save right away, before the (slow, sometimes hanging) entry scan runs --
+    # runs killed mid-scan previously lost the record of these sells.
+    sm.save(config.STATE_FILE, state_ref[0])
 
     history = state_ref[0]["history"]
     closed = history[-1] if history else {}

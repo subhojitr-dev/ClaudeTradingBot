@@ -74,7 +74,8 @@ def save(state_file: str, state: dict) -> None:
         json.dump(state, f, indent=2, default=str)
 
 
-def open_strangle(state: dict, symbol: str, legs: dict, earnings_date: str) -> None:
+def open_strangle(state: dict, symbol: str, legs: dict, earnings_date: str,
+                  stock_price: float | None = None) -> None:
     """Record a newly opened strangle position."""
     total_cost = (legs["call_ask"] + legs["put_ask"]) * 100
     state["active"][symbol] = {
@@ -83,6 +84,7 @@ def open_strangle(state: dict, symbol: str, legs: dict, earnings_date: str) -> N
         "earnings_date":    earnings_date,
         "entry_date":       date.today().isoformat(),
         "expiry":           legs["expiry"],
+        "entry_stock_price": round(stock_price, 2) if stock_price else None,
 
         "call_contract":    legs["call_contract"],
         "call_strike":      legs["call_strike"],
