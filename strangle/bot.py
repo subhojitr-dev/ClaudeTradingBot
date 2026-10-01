@@ -25,6 +25,7 @@ Runs every 30 min via Windows Task Scheduler (same window as other bots).
 import logging
 import os
 import sys
+import time
 from datetime import date
 
 # ── Bootstrap ────────────────────────────────────────────────
@@ -136,12 +137,24 @@ state_ref = [None]
 
 # ── Combined-position monitoring ────────────────────────────────
 
+# How long to wait for a sell order to fill before cancelling it and retrying
+# on the next run. Orders used to be left as unfilled day orders that quietly
+# expired while the bot recorded the leg as sold.
+FILL_WAIT_SECONDS = 20
+
+
+def _underlying(symbol: str, pos: dict) -> str:
+    # Active keys are normally the ticker; a second concurrent trade on the same
+    # ticker is keyed "TICKER@entry_date".
+    return pos.get("underlying") or symbol.split("@")[0]
+
+
 def _leg_value(pos: dict, positions: dict, sold_key: str, contract_key: str):
-    """Return (value_in_dollars, live_mid_or_None, still_open: bool) for one leg.
+    """Return (value_in_dollars, sell_price_or_None, still_open: bool) for one leg.
 
     Already-sold legs contribute their locked-in proceeds. Still-open legs
-    contribute their current mid price -- or None if the contract isn't in
-    our Alpaca positions at all (expired/exercised/removed unexpectedly).
+    contribute their current mid price (and are sold at the bid) -- or value
+    None if the contract isn't in our Alpaca positions at all.
     """
     sold_price = pos.get(sold_key)
     if sold_price is not None:
@@ -149,12 +162,37 @@ def _leg_value(pos: dict, positions: dict, sold_key: str, contract_key: str):
 
     occ = pos[contract_key]
     if occ not in positions:
+        log.warning("  %s not in Alpaca positions but not marked sold -- skipping", occ)
         return None, None, False
 
-    mid = ac.extract_mid(ac.get_option_snapshot(occ))
+    snap = ac.get_option_snapshot(occ)
+    mid = ac.extract_mid(snap)
     if mid <= 0:
         return None, None, True
-    return mid * 100, mid, True
+    bid = ac.extract_bid(snap)
+    return mid * 100, (bid if bid > 0 else mid), True
+
+
+def sell_leg(occ: str, price: float):
+    """Sell one contract and wait for Alpaca to confirm the fill.
+    Returns the fill price, or None if it didn't fill (order is cancelled so
+    the next run can retry with a fresh price)."""
+    order = ac.place_option_order(occ, "sell", 1, price)
+    deadline = time.time() + FILL_WAIT_SECONDS
+    while True:
+        o = ac.get_order(order["id"])
+        if o.get("status") == "filled":
+            return float(o["filled_avg_price"])
+        if o.get("status") in ("canceled", "expired", "rejected"):
+            return None
+        if time.time() > deadline:
+            break
+        time.sleep(2)
+    ac.cancel_order(order["id"])
+    o = ac.get_order(order["id"])  # it may have filled while we were cancelling
+    if o.get("status") == "filled":
+        return float(o["filled_avg_price"])
+    return None
 
 
 def monitor_combined(symbol: str, pos: dict, positions: dict) -> None:
@@ -162,8 +200,21 @@ def monitor_combined(symbol: str, pos: dict, positions: dict) -> None:
     cost, and close whatever legs are still open once it moves +/-
     COMBINED_PROFIT_TARGET_PCT / COMBINED_STOP_LOSS_PCT -- never decide
     based on one leg's price in isolation."""
-    call_value, call_mid, call_open = _leg_value(pos, positions, "call_sold_price", "call_contract")
-    put_value,  put_mid,  put_open  = _leg_value(pos, positions, "put_sold_price",  "put_contract")
+    state = state_ref[0]
+
+    # A leg that is gone from the account after expiry expired worthless --
+    # record it at $0 instead of skipping this trade forever.
+    if date.today() > date.fromisoformat(pos["expiry"]):
+        for leg, record in (("call", sm.record_call_sold), ("put", sm.record_put_sold)):
+            if pos.get(f"{leg}_sold_price") is None and pos[f"{leg}_contract"] not in positions:
+                log.info("  %s: %s expired worthless on %s -- recording $0", symbol, leg.upper(), pos["expiry"])
+                record(state, symbol, 0.0, pos["expiry"])
+        if symbol not in state["active"]:
+            sm.save(config.STATE_FILE, state)
+            return
+
+    call_value, call_price, call_open = _leg_value(pos, positions, "call_sold_price", "call_contract")
+    put_value,  put_price,  put_open  = _leg_value(pos, positions, "put_sold_price",  "put_contract")
 
     if call_value is None or put_value is None:
         log.info("  %s: a leg's price is unavailable this run -- skipping", symbol)
@@ -190,33 +241,38 @@ def monitor_combined(symbol: str, pos: dict, positions: dict) -> None:
     # Record why and at what stock price we exited (pos is the same dict that
     # gets archived to history, so these fields travel with the trade).
     try:
-        pos["exit_stock_price"] = round(ac.get_stock_price(symbol), 2) or None
+        pos["exit_stock_price"] = round(ac.get_stock_price(_underlying(symbol, pos)), 2) or None
     except Exception as e:
         log.error("  %s: could not fetch stock price for exit record: %s", symbol, e)
         pos["exit_stock_price"] = None
     pos["close_reason"] = reason
 
-    if call_open:
+    all_filled = True
+    for leg, is_open, price, record in (
+        ("call", call_open, call_price, sm.record_call_sold),
+        ("put",  put_open,  put_price,  sm.record_put_sold),
+    ):
+        if not is_open:
+            continue
         try:
-            ac.place_option_order(pos["call_contract"], "sell", 1, call_mid)
+            fill = sell_leg(pos[f"{leg}_contract"], price)
         except Exception as e:
-            log.error("  %s: sell call failed: %s", symbol, e)
-            return
-        sm.record_call_sold(state_ref[0], symbol, call_mid)
-
-    if put_open:
-        try:
-            ac.place_option_order(pos["put_contract"], "sell", 1, put_mid)
-        except Exception as e:
-            log.error("  %s: sell put failed: %s", symbol, e)
-            return
-        sm.record_put_sold(state_ref[0], symbol, put_mid)
+            log.error("  %s: sell %s failed: %s", symbol, leg, e)
+            fill = None
+        if fill is None:
+            log.info("  %s: %s sell did not fill -- will retry next run", symbol, leg.upper())
+            all_filled = False
+            continue
+        record(state, symbol, fill)
 
     # Save right away, before the (slow, sometimes hanging) entry scan runs --
     # runs killed mid-scan previously lost the record of these sells.
-    sm.save(config.STATE_FILE, state_ref[0])
+    sm.save(config.STATE_FILE, state)
 
-    history = state_ref[0]["history"]
+    if not all_filled:
+        return
+
+    history = state["history"]
     closed = history[-1] if history else {}
     notify.notify_combined_close(
         symbol=symbol,
@@ -269,7 +325,7 @@ def run() -> None:
 
         status = pos["status"]
 
-        if status in ("OPEN", "CALL_SOLD"):
+        if status in ("OPEN", "CALL_SOLD", "PUT_SOLD"):
             # Same combined-position check whether we're pre- or post-earnings --
             # phase only matters for other bookkeeping, not for this decision.
             monitor_combined(symbol, pos, positions)

@@ -439,7 +439,9 @@ def build_strangle_rows() -> dict:
     rows = {}
     state = load_json(os.path.join(ROOT, "strangle", "strangle_state.json"), {"active": {}, "history": []})
 
-    for symbol, pos in state.get("active", {}).items():
+    for key, pos in state.get("active", {}).items():
+        # A second concurrent trade on one ticker is keyed "TICKER@entry_date".
+        symbol = pos.get("underlying") or key.split("@")[0]
         trade_id = f"STR-{symbol}-{pos.get('entry_date')}"
         need_mids = []
         if pos.get("call_sold_price") is None:
@@ -477,7 +479,7 @@ def build_strangle_rows() -> dict:
         )
 
     for pos in state.get("history", []):
-        sym = occ_underlying(pos.get("call_contract", ""))
+        sym = pos.get("underlying") or occ_underlying(pos.get("call_contract", ""))
         trade_id = f"STR-{sym}-{pos.get('entry_date')}"
         net_pnl = pos.get("net_pnl", 0) or 0
         cost = pos.get("total_cost", 0) or 0
@@ -489,11 +491,12 @@ def build_strangle_rows() -> dict:
         rows[trade_id] = make_row(
             "Strangle", sym, "strangle", "CLOSED", pos.get("entry_date"), 1,
             cost / 100, (cost + net_pnl) / 100, net_pnl, gain_p,
-            closed_at=pos.get("put_sold_date") or pos.get("call_sold_date"),
+            closed_at=max(d for d in (pos.get("put_sold_date"), pos.get("call_sold_date"), "") if d is not None) or None,
             close_reason=pos.get("abandon_reason") or pos.get("close_reason") or "Both legs closed",
             notes=f"earnings={pos.get('earnings_date')}"
                   + (f" stock_entry={pos['entry_stock_price']}" if pos.get("entry_stock_price") else "")
-                  + (f" stock_exit={pos['exit_stock_price']}" if pos.get("exit_stock_price") else ""),
+                  + (f" stock_exit={pos['exit_stock_price']}" if pos.get("exit_stock_price") else "")
+                  + (f" rules={pos['exit_rules']}" if pos.get("exit_rules") else ""),
             legs=closed_str_legs,
         )
     return rows
@@ -586,8 +589,10 @@ def merge_rows(existing: dict, new_rows: dict) -> dict:
     merged = dict(existing)
     for trade_id, row in new_rows.items():
         prev = merged.get(trade_id)
-        if prev and prev.get("status") == "CLOSED":
-            continue  # frozen -- never touch a closed trade again
+        # Closed rows are frozen -- except Strangle, whose rows are rebuilt from
+        # strangle_state.json every run (reconciled against Alpaca fills).
+        if prev and prev.get("status") == "CLOSED" and row.get("strategy") != "Strangle":
+            continue
         merged[trade_id] = row
     return merged
 

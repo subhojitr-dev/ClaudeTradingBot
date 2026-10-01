@@ -139,6 +139,10 @@ def extract_mid(snapshot: dict) -> float:
     return float(t.get("p") or 0)
 
 
+def extract_bid(snapshot: dict) -> float:
+    return float(snapshot.get("latestQuote", {}).get("bp") or 0)
+
+
 def extract_ask(snapshot: dict) -> float:
     return float(snapshot.get("latestQuote", {}).get("ap") or 0)
 
@@ -172,3 +176,15 @@ def place_option_order(
         log.error("Order FAILED %s: %s", r.status_code, r.text[:300])
         r.raise_for_status()
     return r.json()
+
+
+def get_order(order_id: str) -> dict:
+    r = requests.get(f"{ALPACA_BASE_URL}/orders/{order_id}", headers=HEADERS, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+def cancel_order(order_id: str) -> None:
+    r = requests.delete(f"{ALPACA_BASE_URL}/orders/{order_id}", headers=HEADERS, timeout=10)
+    if not r.ok and r.status_code not in (404, 422):  # 422 = already filled/closed
+        r.raise_for_status()

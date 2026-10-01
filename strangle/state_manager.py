@@ -5,7 +5,8 @@ State machine per symbol:
 
   SCANNING      → criteria not yet met, keep checking each run
   OPEN          → both legs bought, monitoring pre-earnings
-  CALL_SOLD     → call taken off pre-earnings, holding put through event
+  CALL_SOLD     → call sold (fill confirmed), put still open
+  PUT_SOLD      → put sold (fill confirmed), call still open
   CLOSED        → both legs exited; record moved to history
 
 State file format (strangle_state.json):
@@ -107,30 +108,33 @@ def open_strangle(state: dict, symbol: str, legs: dict, earnings_date: str,
     log.info("State: opened strangle on %s (cost $%.2f)", symbol, total_cost)
 
 
-def record_call_sold(state: dict, symbol: str, sell_price: float) -> None:
+def record_call_sold(state: dict, symbol: str, sell_price: float, sold_date: str | None = None) -> None:
+    _record_leg_sold(state, symbol, "call", sell_price, sold_date)
+
+
+def record_put_sold(state: dict, symbol: str, sell_price: float, sold_date: str | None = None) -> None:
+    _record_leg_sold(state, symbol, "put", sell_price, sold_date)
+
+
+def _record_leg_sold(state: dict, symbol: str, leg: str, sell_price: float, sold_date: str | None) -> None:
+    """Record one leg's confirmed exit (a fill, or $0 for an expired leg).
+    The trade is only closed and archived once BOTH legs have exited."""
     pos = state["active"].get(symbol)
     if not pos:
         return
-    pos["call_sold_price"] = round(sell_price, 4)
-    pos["call_sold_date"]  = date.today().isoformat()
-    pos["status"]          = "CALL_SOLD"
-    proceeds               = sell_price * 100
-    pos["total_proceeds"]  = round(pos["total_proceeds"] + proceeds, 2)
-    log.info("State: call sold on %s @ $%.2f (proceeds $%.2f)", symbol, sell_price, proceeds)
+    pos[f"{leg}_sold_price"] = round(sell_price, 4)
+    pos[f"{leg}_sold_date"]  = sold_date or date.today().isoformat()
+    proceeds                 = sell_price * 100
+    pos["total_proceeds"]    = round(pos["total_proceeds"] + proceeds, 2)
+    log.info("State: %s sold on %s @ $%.2f (proceeds $%.2f)", leg, symbol, sell_price, proceeds)
 
-
-def record_put_sold(state: dict, symbol: str, sell_price: float) -> None:
-    pos = state["active"].get(symbol)
-    if not pos:
-        return
-    pos["put_sold_price"]  = round(sell_price, 4)
-    pos["put_sold_date"]   = date.today().isoformat()
-    proceeds               = sell_price * 100
-    pos["total_proceeds"]  = round(pos["total_proceeds"] + proceeds, 2)
-    pos["net_pnl"]         = round(pos["total_proceeds"] - pos["total_cost"], 2)
-    pos["status"]          = "CLOSED"
-    log.info("State: put sold on %s @ $%.2f  Net P&L = $%.2f", symbol, sell_price, pos["net_pnl"])
-    _archive(state, symbol)
+    if pos.get("call_sold_price") is not None and pos.get("put_sold_price") is not None:
+        pos["net_pnl"] = round(pos["total_proceeds"] - pos["total_cost"], 2)
+        pos["status"]  = "CLOSED"
+        log.info("State: %s fully closed  Net P&L = $%.2f", symbol, pos["net_pnl"])
+        _archive(state, symbol)
+    else:
+        pos["status"] = "CALL_SOLD" if leg == "call" else "PUT_SOLD"
 
 
 def switch_to_post_earnings(state: dict, symbol: str) -> None:
